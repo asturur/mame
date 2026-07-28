@@ -529,8 +529,10 @@ void rbisland_state::main_map(address_map &map)
 {
 	map(0x000000, 0x07ffff).rom();
 	map(0x10c000, 0x10ffff).ram();             // main RAM
-	map(0x200000, 0x200fff).ram().w(m_palette, FUNC(palette_device::write16)).share("palette");
-	map(0x201000, 0x203fff).ram();             // r/w in initial checks
+	// Color RAM select (PAL B22-06) decodes only A[23:18]==0x08 and the palette
+	// RAM only A[11:1], so 0x200000-0x23ffff all mirror the 0x1000-byte palette.
+	// The 0x201000-0x203fff window the boot RAM test writes is that same mirror.
+	map(0x200000, 0x200fff).mirror(0x03f000).ram().w(m_palette, FUNC(palette_device::write16)).share("palette");
 	map(0x390000, 0x390003).portr("DSWA");
 	map(0x3a0000, 0x3a0001).w(m_pc090oj, FUNC(pc090oj_device::sprite_ctrl_w));
 	map(0x3b0000, 0x3b0003).portr("DSWB");
@@ -827,10 +829,8 @@ void rbisland_state::rbisland(machine_config &config)
 
 	// video hardware
 	screen_device &screen(SCREEN(config, "screen", SCREEN_TYPE_RASTER));
-	screen.set_refresh_hz(60);
-	screen.set_vblank_time(ATTOSECONDS_IN_USEC(0));
-	screen.set_size(40*8, 32*8);
-	screen.set_visarea(0*8, 40*8-1, 2*8, 30*8-1);
+	// OVCK pixel clock = 26.686MHz/4 = 6.6715MHz; 424 x 262 -> 60.056Hz (PCB timing sheet)
+	screen.set_raw(26.686_MHz_XTAL/4, 424, 0*8, 40*8, 262, 2*8, 30*8);
 	screen.set_screen_update(FUNC(rbisland_state::screen_update));
 	screen.set_palette(m_palette);
 
