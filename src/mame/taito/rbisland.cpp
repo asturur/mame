@@ -529,9 +529,9 @@ void rbisland_state::main_map(address_map &map)
 {
 	map(0x000000, 0x07ffff).rom();
 	map(0x10c000, 0x10ffff).ram();             // main RAM
-	// Color RAM select (PAL B22-06) decodes only A[23:18]==0x08 and the palette
-	// RAM only A[11:1], so 0x200000-0x23ffff all mirror the 0x1000-byte palette.
-	// The 0x201000-0x203fff window the boot RAM test writes is that same mirror.
+	// COLRAM select (PAL B22-06) = A[23:18]==0x08; palette RAM uses A[11:1]; A[17:12] undecoded.
+	// mirror(0x3f000) = A[17:12], aliasing the palette across the block (the boot RAM test hits
+	// one alias). PAL also gates on both strobes (word access); not modelled, inert for 16-bit.
 	map(0x200000, 0x200fff).mirror(0x03f000).ram().w(m_palette, FUNC(palette_device::write16)).share("palette");
 	map(0x390000, 0x390003).portr("DSWA");
 	map(0x3a0000, 0x3a0001).w(m_pc090oj, FUNC(pc090oj_device::sprite_ctrl_w));
