@@ -9,7 +9,8 @@ video reference: https://www.youtube.com/watch?v=Efr9EQkbCSQ
 
 TODO:
 - validate/refine reconstructed level data, especially later-stage animated layouts
-- model C50 execution timing rather than using high-level synchronous command handlers
+- port level, RAM text, credits and dynamic HUD operations to the experimental firmware
+- identify the original C50 CPU, clock and external bus rather than the 6801U4 surrogate
 - test mode doesn't work (there are strings for it in the MCU data ROM, is the MCU involved?)
 
 NOTES ON MCU DATA ROM FORMAT
@@ -118,13 +119,14 @@ several other games in m62.cpp also draw their backgrounds in 4 tile wide strips
 
 #include "emu.h"
 #include "m62.h"
+
+#include "cpu/m6800/m6801.h"
 #include "iremipt.h"
 
 #include "machine/timer.h"
 
-// C50 replacement firmware, owning the external data-ROM cipher, level/object
-// commands and HUD mailbox jobs.  It is a MAME device rather than video glue
-// so its state and VRAM bus can be carried forward to a clocked FPGA model.
+// Inactive HLE reference retained during the experimental 6801 firmware port.
+// The configured machine below uses the real M6801U4 CPU device and ROM.
 class bkungfu_c50_device : public device_t
 {
 public:
@@ -194,7 +196,7 @@ class m62_bkungfu_state : public m62_state
 public:
 	m62_bkungfu_state(const machine_config &mconfig, device_type type, const char *tag)
 		: m62_state(mconfig, type, tag)
-		, m_c50(*this, "c50")
+		, m_mcu(*this, "mcu")
 		, m_bkungfu_tileram(*this, "tileram", 256*32*2, ENDIANNESS_LITTLE)
 		, m_blitterdatarom(*this, "blitterdat")
 	{ }
@@ -207,12 +209,15 @@ private:
 
 	void mem_map(address_map &map) ATTR_COLD;
 	void io_map(address_map &map) ATTR_COLD;
+	void mcu_map(address_map &map) ATTR_COLD;
 
 	uint8_t bkungfu_blitter_r(offs_t offset);
 	void bkungfu_blitter_w(offs_t offset, uint8_t data);
-	void c50_vram_w(offs_t offset, uint8_t data);
-	void c50_level_vram_w(offs_t offset, uint8_t data);
-	void c50_mailbox_w(offs_t offset, uint8_t data);
+	uint8_t mcu_data_r(offs_t offset);
+	uint8_t mcu_mailbox_r(offs_t offset);
+	void mcu_mailbox_w(offs_t offset, uint8_t data);
+	void mcu_vram_w(offs_t offset, uint8_t data);
+	void mcu_level_vram_w(offs_t offset, uint8_t data);
 
 	TILE_GET_INFO_MEMBER(get_bkungfu_bg_tile_info);
 	DECLARE_VIDEO_START(bkungfu);
@@ -222,7 +227,7 @@ private:
 	// done this way so it can be viewed win the debugger with save state registration
 	uint8_t m_blittercmdram[0x800];
 
-	required_device<bkungfu_c50_device> m_c50;
+	required_device<m6801u4_cpu_device> m_mcu;
 
 	memory_share_creator<uint8_t> m_bkungfu_tileram;
 
@@ -838,12 +843,27 @@ void m62_bkungfu_state::bkungfu_blitter_tilemap_w(uint16_t offset, uint8_t data)
 	}
 }
 
-void m62_bkungfu_state::c50_vram_w(offs_t offset, uint8_t data)
+uint8_t m62_bkungfu_state::mcu_data_r(offs_t offset)
+{
+	return m_blitterdatarom[offset & 0x7fff];
+}
+
+uint8_t m62_bkungfu_state::mcu_mailbox_r(offs_t offset)
+{
+	return m_blittercmdram[offset & 0x7ff];
+}
+
+void m62_bkungfu_state::mcu_mailbox_w(offs_t offset, uint8_t data)
+{
+	m_blittercmdram[offset & 0x7ff] = data;
+}
+
+void m62_bkungfu_state::mcu_vram_w(offs_t offset, uint8_t data)
 {
 	bkungfu_blitter_tilemap_w(offset & 0x0fff, data);
 }
 
-void m62_bkungfu_state::c50_level_vram_w(offs_t offset, uint8_t data)
+void m62_bkungfu_state::mcu_level_vram_w(offs_t offset, uint8_t data)
 {
 	if (offset < m_bkungfu_tileram.bytes())
 	{
@@ -852,19 +872,11 @@ void m62_bkungfu_state::c50_level_vram_w(offs_t offset, uint8_t data)
 	}
 }
 
-void m62_bkungfu_state::c50_mailbox_w(offs_t offset, uint8_t data)
-{
-	if (offset < 0x800)
-		m_blittercmdram[offset] = data;
-}
-
 void m62_bkungfu_state::machine_start()
 {
 	m62_state::machine_start();
 
 	save_item(NAME(m_blittercmdram));
-
-	m_c50->set_data_rom(&m_blitterdatarom[0]);
 }
 
 void m62_bkungfu_state::machine_reset()
@@ -881,12 +893,9 @@ void m62_bkungfu_state::bkungfu_blitter_w(offs_t offset, uint8_t data)
 	int pc = m_maincpu->pc();
 
 	m_blittercmdram[offset] = data;
-	if (offset < 0x800)
-		m_c50->mailbox_w(offset, data);
 
 	if (offset == 0x00)
 	{
-		m_c50->command_w(data);
 		if (data == 0x14)
 		{
 			logerror("%s: Command %02x: blitter: draw text from ROM\n", machine().describe_context(), data);
@@ -1096,6 +1105,15 @@ void m62_bkungfu_state::bkungfu_blitter_w(offs_t offset, uint8_t data)
     Address Maps
 *******************************************************************************/
 
+void m62_bkungfu_state::mcu_map(address_map &map)
+{
+	// Surrogate firmware bus, not a claim about the undumped C50 pinout.
+	map(0x1000, 0x8fff).r(FUNC(m62_bkungfu_state::mcu_data_r));
+	map(0x9000, 0x97ff).rw(FUNC(m62_bkungfu_state::mcu_mailbox_r), FUNC(m62_bkungfu_state::mcu_mailbox_w));
+	map(0xa000, 0xafff).w(FUNC(m62_bkungfu_state::mcu_vram_w));
+	map(0xb000, 0xefff).w(FUNC(m62_bkungfu_state::mcu_level_vram_w));
+}
+
 void m62_bkungfu_state::mem_map(address_map& map)
 {
 	map(0x0000, 0xbfff).rom();
@@ -1128,10 +1146,11 @@ void m62_bkungfu_state::bkungfu(machine_config& config)
 	m_maincpu->set_addrmap(AS_PROGRAM, &m62_bkungfu_state::mem_map);
 	m_maincpu->set_addrmap(AS_IO, &m62_bkungfu_state::io_map);
 
-	BKUNG_C50(config, m_c50, 0);
-	m_c50->vram_w().set(FUNC(m62_bkungfu_state::c50_vram_w));
-	m_c50->level_vram_w().set(FUNC(m62_bkungfu_state::c50_level_vram_w));
-	m_c50->mailbox_out_w().set(FUNC(m62_bkungfu_state::c50_mailbox_w));
+	// Experimental replacement target.  The original C50 CPU and clock remain
+	// unknown; 4 MHz is a practical 6801U4 firmware-development clock.
+	M6801U4(config, m_mcu, XTAL(4'000'000));
+	m_mcu->set_addrmap(AS_PROGRAM, &m62_bkungfu_state::mcu_map);
+	config.set_perfect_quantum(m_maincpu);
 
 	MCFG_VIDEO_START_OVERRIDE(m62_bkungfu_state,bkungfu)
 }
@@ -1149,7 +1168,7 @@ ROM_START( bkungfu )
 	ROM_LOAD( "km-z.7j", 0x08000, 0x4000, CRC(2bd2aa83) SHA1(422ef2a64f040a0974311ff692726c6f3a8f8b13) )
 
 	ROM_REGION( 0x1000, "mcu", 0 )
-	ROM_LOAD( "mcu",     0x0000, 0x1000, NO_DUMP )
+	ROM_LOAD( "bkungfu_c50_6801.bin", 0x0000, 0x1000, CRC(adc7d400) SHA1(ec32f5943e2e3f6b9e041114d03d7ca72f5c9715) )
 
 	ROM_REGION( 0x10000, "blitterdat", ROMREGION_ERASEFF )
 	ROM_LOAD( "km-z.4h", 0x0000, 0x8000, CRC(252bb4a9) SHA1(2a69ee113950ea58895b42102bbb5263865ace9d) )
