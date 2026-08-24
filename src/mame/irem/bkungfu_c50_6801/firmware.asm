@@ -36,12 +36,24 @@ level_count    = $5c
 level_expected = $5d
 level_streamptr = $5e
 level_temp     = $60
+hud_valid      = $61
+hud_initialized = $62
+hud_slot       = $63
+hud_mask       = $64
+hud_index      = $65
+hud_value      = $66
+hud_work       = $67
+hud_full       = $68
+hud_dest       = $69
+hud_source     = $6b
 
 	* = $f000
 
 reset
 	sei
 	lds  #$00ff
+	clr  hud_valid
+	clr  hud_initialized
 
 ;;; The Z80 RAM test leaves the mailbox clear, then writes command $fe.
 wait_start
@@ -89,13 +101,15 @@ command_check_02
 	jmp  command_level_draw
 command_check_05
 	cmpa #$05
-	beq  command_ack
+	beq  command_phase_complete
 	cmpa #$0a
 	bne  command_check_0c
 	jmp  command_hud
 command_check_0c
 	cmpa #$0c
-	beq  command_ack
+	bne  command_check_0d
+	jmp  command_ram_text
+command_check_0d
 	cmpa #$0d
 	bne  command_check_0f
 	jmp  command_text
@@ -105,7 +119,9 @@ command_check_0f
 	jmp  command_object
 command_check_10
 	cmpa #$10
-	beq  command_ack
+	bne  command_check_14
+	jmp  command_credits
+command_check_14
 	cmpa #$14
 	bne  command_done
 	jmp  command_text
@@ -119,10 +135,19 @@ command_ack
 	staa mailbox
 	rts
 
+;;; Command $05 is a parameterless batch/phase boundary.  Every Z80 call site
+;;; issues it after other drawing work, supplies no data, and either continues
+;;; immediately or treats the still-visible $05 as an acceptable ready state.
+;;; No independent ROM or VRAM operation is observable, so acknowledgement is
+;;; its complete recovered behavior rather than an invented drawing effect.
+command_phase_complete
+	bra  command_ack
+
 ;;; Command $08 is the first real drawing primitive.  C801 is the attribute
 ;;; and C802 is the tile byte.  The MAME-side bus expands this 4 KiB page over
 ;;; the four currently mirrored tilemap pages, just as the HLE model does.
 command_clear
+	clr  hud_initialized
 	ldaa mailbox+2
 	staa scratch_tile
 	ldaa mailbox+1
@@ -139,6 +164,92 @@ clear_loop
 	cpx  #$b000
 	bne  clear_loop
 	bra  command_ack
+
+;;; Command $0c interprets a text stream prepared by the Z80 in shared RAM at
+;;; C900.  Its grammar matches the ROM text scripts, but its persistent
+;;; position and attribute registers are C803-C805 rather than C802-C804.
+command_ram_text
+	ldx  #mailbox+$100
+ram_text_loop
+	ldaa 0,x
+	inx
+	beq  ram_text_complete
+	cmpa #$01
+	beq  ram_text_attr
+	cmpa #$02
+	beq  ram_text_position
+
+	stx  hud_source
+	staa hud_value
+	ldaa mailbox+4
+	anda #$0f
+	oraa #$a0
+	staa hud_dest
+	ldaa mailbox+3
+	staa hud_dest+1
+	ldx  hud_dest
+	ldaa hud_value
+	staa 0,x
+	ldaa mailbox+5
+	staa 1,x
+
+	ldaa mailbox+3
+	staa hud_value
+	adda #$02
+	anda #$7f
+	staa hud_work
+	ldaa hud_value
+	anda #$80
+	oraa hud_work
+	staa mailbox+3
+	ldx  hud_source
+	bra  ram_text_loop
+
+ram_text_attr
+	ldaa 0,x
+	staa mailbox+5
+	inx
+	bra  ram_text_loop
+
+ram_text_position
+	ldaa 0,x
+	staa mailbox+3
+	inx
+	ldaa 0,x
+	staa mailbox+4
+	inx
+	bra  ram_text_loop
+
+ram_text_complete
+	jmp  command_ack
+
+;;; Command $10 writes the two packed-BCD credit/continue digits at the
+;;; caller-supplied tilemap position, leaving no hard-coded text in the device.
+command_credits
+	ldaa mailbox+3
+	anda #$0f
+	oraa #$a0
+	staa hud_dest
+	ldaa mailbox+2
+	staa hud_dest+1
+	ldx  hud_dest
+	ldaa mailbox+1
+	staa hud_value
+	lsra
+	lsra
+	lsra
+	lsra
+	adda #$30
+	staa 0,x
+	ldaa mailbox+4
+	staa 1,x
+	ldaa hud_value
+	anda #$0f
+	adda #$30
+	staa 2,x
+	ldaa mailbox+4
+	staa 3,x
+	jmp  command_ack
 
 ;;; Command $01 selects one of the sixteen level directories.  Command $02
 ;;; expands that directory into the full playfield.  Each of the 56 entries
@@ -469,6 +580,12 @@ rom_script_position_map
 	bra  rom_script_loop
 
 rom_script_complete
+	ldaa script_persist
+	bne  rom_script_ack
+	ldaa #$01
+	staa hud_initialized
+	jsr  hud_redraw_valid
+rom_script_ack
 	jmp  command_ack
 
 ;;; Command $0f object records are selected by C801.  The plaintext directory
@@ -575,27 +692,250 @@ object_set_attr
 object_complete
 	jmp  command_ack
 
-;;; Each HUD trigger is the first byte of a four-byte mailbox slot.  Dynamic
-;;; drawing is not ported yet, but ownership and completion already reside in
-;;; the firmware rather than in the Z80 driver.
+;;; Each HUD trigger is the first byte of a four-byte mailbox slot.  Parameters
+;;; remain in shared RAM after the trigger becomes $fe, so one validity bit per
+;;; slot is sufficient MCU state.  Before command $0a establishes the fixed HUD
+;;; geometry, jobs are remembered and acknowledged; afterwards they also draw.
 service_hud_slots
-	ldx  #mailbox+$10
+	ldaa #$10
+	staa hud_slot
+	ldaa #$01
+	staa hud_mask
 
 hud_slot_loop
+	ldx  #mailbox
+	ldab hud_slot
+	abx
 	ldaa 0,x
 	beq  hud_slot_next
 	cmpa #$fe
 	beq  hud_slot_next
+
+	ldaa hud_valid
+	oraa hud_mask
+	staa hud_valid
+	ldaa hud_initialized
+	beq  hud_slot_ack
+	jsr  hud_draw_slot
+
+hud_slot_ack
+	ldx  #mailbox
+	ldab hud_slot
+	abx
 	ldaa #$fe
 	staa 0,x
 
 hud_slot_next
-	inx
-	inx
-	inx
-	inx
-	cpx  #mailbox+$30
+	ldaa hud_mask
+	asla
+	staa hud_mask
+	ldaa hud_slot
+	adda #$04
+	staa hud_slot
+	cmpa #$30
 	bne  hud_slot_loop
+	rts
+
+;;; Reapply every submitted semantic value after command $0a redraws the fixed
+;;; HUD scaffold.  This mirrors the MCU retaining scoreboard state across the
+;;; tilemap clear that precedes each level.
+hud_redraw_valid
+	ldaa #$10
+	staa hud_slot
+	ldaa #$01
+	staa hud_mask
+hud_redraw_loop
+	ldaa hud_valid
+	bita hud_mask
+	beq  hud_redraw_next
+	jsr  hud_draw_slot
+hud_redraw_next
+	ldaa hud_mask
+	asla
+	staa hud_mask
+	ldaa hud_slot
+	adda #$04
+	staa hud_slot
+	cmpa #$30
+	bne  hud_redraw_loop
+	rts
+
+hud_draw_slot
+	ldaa hud_slot
+	cmpa #$10
+	bne  hud_check_p2
+	ldx  #$a028
+	ldab #$11
+	jmp  hud_score
+hud_check_p2
+	cmpa #$14
+	bne  hud_check_top
+	ldx  #$a052
+	ldab #$15
+	jmp  hud_score
+hud_check_top
+	cmpa #$18
+	bne  hud_check_timer
+	ldx  #$a03e
+	ldab #$19
+	jmp  hud_score
+hud_check_timer
+	cmpa #$1c
+	bne  hud_check_floor
+	ldx  #$a2ca
+	stx  hud_dest
+	ldx  #mailbox+$1d
+	stx  hud_source
+	ldaa #$02
+	staa hud_work
+	jsr  hud_write_bcd_bytes
+	rts
+hud_check_floor
+	cmpa #$20
+	bne  hud_check_lives
+	jmp  hud_floor
+hud_check_lives
+	cmpa #$24
+	bne  hud_check_player_energy
+	ldaa mailbox+$25
+	anda #$0f
+	adda #$30
+	staa $a2da
+	rts
+hud_check_player_energy
+	cmpa #$28
+	bne  hud_check_boss_energy
+	ldx  #$a12e
+	ldaa #$c4
+	bra  hud_energy_start
+hud_check_boss_energy
+	cmpa #$2c
+	bne  hud_draw_done
+	ldx  #$a22e
+	ldaa #$cc
+hud_energy_start
+	stx  hud_dest
+	staa hud_value
+	jsr  hud_energy
+hud_draw_done
+	rts
+
+;;; Score destinations differ, but all three consume three packed-BCD bytes.
+;;; X is the tile destination and B the low byte of the parameter address.
+hud_score
+	stx  hud_dest
+	ldx  #mailbox
+	abx
+	stx  hud_source
+	ldaa #$03
+	staa hud_work
+	jsr  hud_write_bcd_bytes
+	rts
+
+hud_write_bcd_bytes
+	ldx  hud_source
+	ldaa 0,x
+	inx
+	stx  hud_source
+	staa hud_value
+	ldx  hud_dest
+	lsra
+	lsra
+	lsra
+	lsra
+	adda #$30
+	staa 0,x
+	ldaa hud_value
+	anda #$0f
+	adda #$30
+	staa 2,x
+	ldab #$04
+	abx
+	stx  hud_dest
+	dec  hud_work
+	bne  hud_write_bcd_bytes
+	rts
+
+hud_floor
+	clr  hud_work             ; nonzero means every dot is unlit
+	ldaa mailbox+$21
+	staa hud_value
+	ldaa mailbox+$20
+	cmpa #$02
+	bne  hud_floor_start
+	ldaa hud_value
+	bne  hud_floor_flash
+	inc  hud_work
+	bra  hud_floor_start
+hud_floor_flash
+	dec  hud_value
+hud_floor_start
+	clr  hud_index
+	ldx  #$a1c0
+hud_floor_loop
+	ldaa hud_work
+	bne  hud_floor_unlit
+	ldaa hud_index
+	cmpa hud_value
+	bls  hud_floor_lit
+hud_floor_unlit
+	ldaa #$d6
+	bra  hud_floor_write
+hud_floor_lit
+	ldaa #$d5
+hud_floor_write
+	staa 0,x
+	ldab #$04
+	abx
+	inc  hud_index
+	ldaa hud_index
+	cmpa #$08
+	bne  hud_floor_loop
+	rts
+
+hud_energy
+	ldx  #mailbox
+	ldab hud_slot
+	abx
+	ldaa 1,x
+	cmpa #$41
+	bcc  hud_energy_done
+	staa hud_work
+	anda #$78
+	lsra
+	lsra
+	lsra
+	staa hud_full
+	ldaa hud_work
+	anda #$07
+	staa hud_work
+	clr  hud_index
+	ldx  hud_dest
+hud_energy_loop
+	ldaa hud_index
+	cmpa hud_full
+	bcs  hud_energy_full
+	bne  hud_energy_empty
+	ldaa hud_work
+	beq  hud_energy_empty
+	ldaa hud_value
+	adda #$08
+	suba hud_work
+	bra  hud_energy_write
+hud_energy_full
+	ldaa hud_value
+	bra  hud_energy_write
+hud_energy_empty
+	ldaa #$c2
+hud_energy_write
+	staa 0,x
+	inx
+	inx
+	inc  hud_index
+	ldaa hud_index
+	cmpa #$08
+	bne  hud_energy_loop
+hud_energy_done
 	rts
 
 ;;; Decode one byte from the raw external data ROM.  X is a physical surrogate

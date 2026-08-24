@@ -30,13 +30,18 @@ Current firmware status:
   frames, and later-stage animation objects;
 - `01`/`02`: level selection and direct encrypted-stream expansion into the
   complete 56-column playfield, without a decoded level buffer;
-- eight `c810-c82f` HUD slots: recognized and acknowledged, drawing not ported;
-- `05`, `0c`, and `10`: explicitly recognized placeholders.
+- `0c`: shared-RAM high-score text scripts;
+- `10`: two packed-BCD credits/continue digits;
+- all eight `c810-c82f` HUD slots: packed-BCD scores and timer, floor dots,
+  lives, player energy and boss energy;
+- `05`: parameterless drawing-phase boundary, acknowledged with no independent
+  ROM or VRAM operation observed at any Z80 call site.
 
 The on-demand cipher, payload transform, object renderer, and ROM text grammar
-and level renderer are now 6801 code.  RAM high-score text,
-credits/continue digits, and dynamic HUD arithmetic remain in the inactive HLE
-reference on this branch until they are ported.
+and level renderer are now 6801 code.  The known RAM text and dynamic HUD
+operations are also firmware-owned.  All observed main commands and HUD slots
+therefore have explicit firmware behavior; the acknowledge-only nature of
+command `05` remains documented as a protocol inference.
 
 Build with the CRASM copy already present in the local JTCORES checkout:
 
