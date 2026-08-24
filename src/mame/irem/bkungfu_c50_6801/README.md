@@ -28,13 +28,15 @@ Current firmware status:
 - `0d`/`14`: persistent-state ROM text scripts;
 - `0f`: encrypted object records and streams, including both dragons, flame
   frames, and later-stage animation objects;
+- `01`/`02`: level selection and direct encrypted-stream expansion into the
+  complete 56-column playfield, without a decoded level buffer;
 - eight `c810-c82f` HUD slots: recognized and acknowledged, drawing not ported;
-- `01`, `02`, `05`, `0c`, and `10`: explicitly recognized placeholders.
+- `05`, `0c`, and `10`: explicitly recognized placeholders.
 
 The on-demand cipher, payload transform, object renderer, and ROM text grammar
-are now 6801 code.  Level strips, RAM high-score text, credits/continue digits,
-and dynamic HUD arithmetic remain in the inactive HLE reference on this branch
-until they are ported.
+and level renderer are now 6801 code.  RAM high-score text,
+credits/continue digits, and dynamic HUD arithmetic remain in the inactive HLE
+reference on this branch until they are ported.
 
 Build with the CRASM copy already present in the local JTCORES checkout:
 

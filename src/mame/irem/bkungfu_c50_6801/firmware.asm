@@ -23,6 +23,19 @@ object_rowskip = $49
 object_dest    = $4a
 object_stream  = $4c
 script_persist = $4e
+level_number   = $4f
+level_block    = $50
+level_entry    = $52
+level_record   = $53
+level_streamno = $55
+level_dest     = $56
+level_base     = $58
+level_attr     = $5a
+level_phase    = $5b
+level_count    = $5c
+level_expected = $5d
+level_streamptr = $5e
+level_temp     = $60
 
 	* = $f000
 
@@ -67,12 +80,14 @@ service_command
 	cmpa #$08
 	beq  command_clear
 
-	;;; Explicitly recognized commands.  Their implementations will replace
-	;;; these acknowledgements one at a time as the HLE algorithms are ported.
 	cmpa #$01
-	beq  command_ack
+	bne  command_check_02
+	jmp  command_level_select
+command_check_02
 	cmpa #$02
-	beq  command_ack
+	bne  command_check_05
+	jmp  command_level_draw
+command_check_05
 	cmpa #$05
 	beq  command_ack
 	cmpa #$0a
@@ -124,6 +139,220 @@ clear_loop
 	cpx  #$b000
 	bne  clear_loop
 	bra  command_ack
+
+;;; Command $01 selects one of the sixteen level directories.  Command $02
+;;; expands that directory into the full playfield.  Each of the 56 entries
+;;; describes one 10- or 16-row band for a pair of screen columns.  Its four
+;;; streams map directly to the four two-tile-wide slices of that column pair,
+;;; so the firmware can decode one stream at a time without a tile buffer.
+command_level_select
+	ldaa mailbox+1
+	staa level_number
+	jmp  command_ack
+
+command_level_draw
+	jsr  level_fill_background
+
+	;;; The raw directory at ROM $0200 contains first-stage-decrypted pointers.
+	ldaa level_number
+	anda #$0f
+	asla
+	tab
+	ldx  #$1200
+	abx
+	jsr  decrypt_data
+	staa level_block+1
+	inx
+	jsr  decrypt_data
+	adda #$10                ; ROM offset -> physical bus address
+	staa level_block
+
+	clr  level_entry
+level_entry_loop
+	jsr  level_draw_entry
+	inc  level_entry
+	ldaa level_entry
+	cmpa #$38
+	bne  level_entry_loop
+	jmp  command_ack
+
+;;; Establish the same safe fallback used by the HLE: tile $05/attribute $19
+;;; over 56 columns * four tiles and 26 rows.  The 64-byte tail of each
+;;; 512-byte tilemap row is outside the scrolling playfield and is skipped.
+level_fill_background
+	clr  level_entry
+	ldx  #$bc00              ; level row zero begins at tilemap row six
+level_fill_row
+	ldab #$e0                ; 56 columns * four tiles
+level_fill_tile
+	ldaa #$05
+	staa 0,x
+	inx
+	ldaa #$19
+	staa 0,x
+	inx
+	decb
+	bne  level_fill_tile
+	ldab #$40
+	abx                         ; advance from 448 to 512 bytes
+	inc  level_entry
+	ldaa level_entry
+	cmpa #$1a
+	bne  level_fill_row
+	rts
+
+;;; Expand one encrypted level entry.  Even entries contain the upper ten rows
+;;; and odd entries the lower sixteen.  Entries 0/1 feed screen columns 0/1,
+;;; entries 2/3 feed columns 2/3, and so on through entries 54/55.
+level_draw_entry
+	ldx  level_block
+	ldaa level_entry
+	asla
+	tab
+	abx
+	jsr  decode_payload
+	staa level_record+1
+	inx
+	jsr  decode_payload
+	adda #$10                ; ROM offset -> physical bus address
+	staa level_record
+
+	;;; Compute the common destination for stream zero.  Top entries start at
+	;;; row 6 ($bc00), bottom entries at row 16 ($d000).
+	ldaa level_entry
+	bita #$01
+	bne  level_entry_bottom
+	ldaa #$14                ; 20 literals = ten rows * two tiles
+	staa level_expected
+	ldaa #$bc
+	bra  level_entry_base_high
+level_entry_bottom
+	ldaa #$20                ; 32 literals = sixteen rows * two tiles
+	staa level_expected
+	ldaa #$d0
+level_entry_base_high
+	staa level_base
+
+	ldaa level_entry
+	anda #$fe
+	staa level_temp
+	lsra
+	lsra
+	lsra
+	lsra
+	lsra                       ; carry into the second 256-byte column block
+	adda level_base
+	staa level_base
+	ldaa level_temp
+	anda #$1f
+	asla
+	asla
+	asla                       ; eight bytes per screen column
+	staa level_base+1
+
+	clr  level_streamno
+level_entry_stream_loop
+	;;; Streams 0-3 begin at byte offsets 0,4,8,12 within the column pair.
+	ldaa level_streamno
+	asla
+	asla
+	adda level_base+1
+	staa level_dest+1
+	ldaa level_base
+	adca #$00
+	staa level_dest
+
+	;;; Each record has four payload-encoded little-endian stream pointers.
+	ldx  level_record
+	ldaa level_streamno
+	asla
+	tab
+	abx
+	jsr  decode_payload
+	staa level_streamptr+1
+	inx
+	jsr  decode_payload
+	adda #$10                ; ROM offset -> physical bus address
+	staa level_streamptr
+
+	clr  level_attr
+	clr  level_phase
+	clr  level_count
+	jsr  level_decode_stream
+	bcs  level_entry_done
+	inc  level_streamno
+	ldaa level_streamno
+	cmpa #$04
+	bne  level_entry_stream_loop
+level_entry_done
+	rts
+
+;;; Level streams use the payload grammar $01 attr, literals, $00 end.  Two
+;;; successive literals form one horizontal slice; after the second, the
+;;; destination advances to the same slice on the following 512-byte row.
+level_decode_stream
+	ldx  level_streamptr
+	jsr  decode_payload
+	staa level_temp
+	inx
+	stx  level_streamptr
+	ldaa level_temp
+	beq  level_stream_end
+	cmpa #$01
+	beq  level_stream_attr
+
+	ldx  level_dest
+	staa 0,x
+	ldaa level_attr
+	staa 1,x
+	inc  level_count
+
+	ldaa level_phase
+	bne  level_stream_second
+	inc  level_phase
+	ldaa level_dest+1
+	adda #$02
+	staa level_dest+1
+	ldaa level_dest
+	adca #$00
+	staa level_dest
+	bra  level_stream_count_check
+
+level_stream_second
+	clr  level_phase
+	ldaa level_dest+1
+	adda #$fe
+	staa level_dest+1
+	ldaa level_dest
+	adca #$01                ; total step is $01fe to the next tilemap row
+	staa level_dest
+
+level_stream_count_check
+	ldaa level_count
+	cmpa level_expected
+	bls  level_decode_stream
+	sec
+	rts
+
+level_stream_attr
+	ldx  level_streamptr
+	jsr  decode_payload
+	staa level_attr
+	inx
+	stx  level_streamptr
+	bra  level_decode_stream
+
+level_stream_end
+	ldaa level_count
+	cmpa level_expected
+	bne  level_stream_invalid
+	ldaa level_phase          ; valid streams always contain literal pairs
+	bne  level_stream_invalid
+	clc
+	rts
+level_stream_invalid
+	sec
+	rts
 
 ;;; Commands $0d/$14 select a two-byte pointer in the plaintext ROM directory.
 ;;; Command $0a uses the fixed pointer at ROM $0140 for the base HUD.  All use
