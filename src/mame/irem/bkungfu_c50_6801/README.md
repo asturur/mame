@@ -20,6 +20,13 @@ The cipher is intended to run per ROM read.  There is no 32 KiB plaintext
 buffer: the recovered first-stage transform is address-local, and commands
 only consume the selected pointer chains and streams.
 
+The MC6801U4 is configured from its normal 4 MHz input clock and given a MAME
+clock scale of 6.  This is explicitly a throughput model for the unknown C50,
+not a claim that a physical MC6801U4 ran at that rate.  It makes command `02`
+complete in about 14 video frames, matching the observed loading cadence:
+the level finishes, the Z80 reveals and walks the player, then its independently
+timed stage-name/`READY` sequence begins.
+
 Current firmware status:
 
 - `fe`: startup plus all observed ready/status bytes;
@@ -28,8 +35,10 @@ Current firmware status:
 - `0d`/`14`: persistent-state ROM text scripts;
 - `0f`: encrypted object records and streams, including both dragons, flame
   frames, and later-stage animation objects;
-- `01`/`02`: level selection and direct encrypted-stream expansion into the
-  complete 56-column playfield, without a decoded level buffer;
+- `01`/`02`: zero-based half-level selection (`00`-`0f`) and direct
+  encrypted-stream expansion into the complete 56-column playfield, without a
+  decoded level buffer or a synthetic background prefill; unloaded columns
+  retain command `08`'s black clear until their encrypted streams are consumed;
 - `0c`: shared-RAM high-score text scripts;
 - `10`: two packed-BCD credits/continue digits;
 - all eight `c810-c82f` HUD slots: packed-BCD scores and timer, floor dots,

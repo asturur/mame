@@ -262,8 +262,6 @@ command_level_select
 	jmp  command_ack
 
 command_level_draw
-	jsr  level_fill_background
-
 	;;; The raw directory at ROM $0200 contains first-stage-decrypted pointers.
 	ldaa level_number
 	anda #$0f
@@ -286,32 +284,6 @@ level_entry_loop
 	cmpa #$38
 	bne  level_entry_loop
 	jmp  command_ack
-
-;;; Establish the same safe fallback used by the HLE: tile $05/attribute $19
-;;; over 56 columns * four tiles and 26 rows.  The 64-byte tail of each
-;;; 512-byte tilemap row is outside the scrolling playfield and is skipped.
-level_fill_background
-	clr  level_entry
-	ldx  #$bc00              ; level row zero begins at tilemap row six
-level_fill_row
-	ldab #$e0                ; 56 columns * four tiles
-level_fill_tile
-	ldaa #$05
-	staa 0,x
-	inx
-	ldaa #$19
-	staa 0,x
-	inx
-	decb
-	bne  level_fill_tile
-	ldab #$40
-	abx                         ; advance from 448 to 512 bytes
-	inc  level_entry
-	ldaa level_entry
-	cmpa #$1a
-	bne  level_fill_row
-	rts
-
 ;;; Expand one encrypted level entry.  Even entries contain the upper ten rows
 ;;; and odd entries the lower sixteen.  Entries 0/1 feed screen columns 0/1,
 ;;; entries 2/3 feed columns 2/3, and so on through entries 54/55.

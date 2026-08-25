@@ -1149,6 +1149,10 @@ void m62_bkungfu_state::bkungfu(machine_config& config)
 	// Experimental replacement target.  The original C50 CPU and clock remain
 	// unknown; 4 MHz is a practical 6801U4 firmware-development clock.
 	M6801U4(config, m_mcu, XTAL(4'000'000));
+	// The 6801 is an ISA/firmware surrogate, not a clock claim for the C50.
+	// Scale it to the recovered blitter throughput (about 14 frames per level
+	// half), so command $02 completes before the Z80 reveals the player sprite.
+	m_mcu->set_clock_scale(6.0);
 	m_mcu->set_addrmap(AS_PROGRAM, &m62_bkungfu_state::mcu_map);
 	config.set_perfect_quantum(m_maincpu);
 
@@ -1168,7 +1172,7 @@ ROM_START( bkungfu )
 	ROM_LOAD( "km-z.7j", 0x08000, 0x4000, CRC(2bd2aa83) SHA1(422ef2a64f040a0974311ff692726c6f3a8f8b13) )
 
 	ROM_REGION( 0x1000, "mcu", 0 )
-	ROM_LOAD( "bkungfu_c50_6801.bin", 0x0000, 0x1000, CRC(9eb3bd6a) SHA1(a3bbaf9d760846f4d945acf578f085705c7a31c5) )
+	ROM_LOAD( "bkungfu_c50_6801.bin", 0x0000, 0x1000, CRC(0deceb1a) SHA1(96f966b7493bc8155c1ad69941fa4f164ab1f760) )
 
 	ROM_REGION( 0x10000, "blitterdat", ROMREGION_ERASEFF )
 	ROM_LOAD( "km-z.4h", 0x0000, 0x8000, CRC(252bb4a9) SHA1(2a69ee113950ea58895b42102bbb5263865ace9d) )
