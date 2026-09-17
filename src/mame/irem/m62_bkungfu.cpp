@@ -1,5 +1,5 @@
 // license:GPL-2.0+
-// copyright-holders:Jonas Jago
+// copyright-holders:Jonas Jago, Andrea Bogazzi
 /*******************************************************************************
 
 Beyond Kung-Fu
@@ -8,8 +8,7 @@ Irem M62-based unreleased Kung-Fu Master sequel
 video reference: https://www.youtube.com/watch?v=Efr9EQkbCSQ
 
 TODO:
-- validate/refine reconstructed level data, especially later-stage animated layouts
-- port level, RAM text, credits and dynamic HUD operations to the experimental firmware
+- determine the purpose of the optional fifth/sixth level composition pointers
 - identify the original C50 CPU, clock and external bus rather than the 6801U4 surrogate
 - test mode doesn't work (there are strings for it in the MCU data ROM, is the MCU involved?)
 
@@ -114,6 +113,77 @@ as the level structures above are each 0x70 bytes wide, this likely means that e
 
 several other games in m62.cpp also draw their backgrounds in 4 tile wide strips
 
+Additional notes from Andrea Bogazzi:
+-------------------------------------
+
+Later traces of a real one-player start resolved the table numbering above.
+The Z80 sends index 00 for the initial Precinct layout, then index 08 for its
+corresponding post-intro/redraw layout.  Therefore 00-07 are the initial states
+for gameplay stages 1-8 and 08-0f are their matching redraw states.  The older
+1,2,3,4,5,6,7,0 interpretation came from following the attract-mode path.
+
+All multi-byte values described below are little-endian.  Bytes at ROM offsets
+0000-153c are plaintext.  Starting at 153d, each byte is independently decoded
+with a 256-byte key table K.  For ROM address A:
+
+    s = (A_low + A_high) & ff
+    first = (s & 1) ? (K[s] - cipher) : (cipher ^ K[s])
+
+This transform is address-local: it has no feedback from preceding bytes and
+can be performed as data is read.  No shorter generator for K is known.
+
+Level/object payload bytes and the pointers stored inside those payloads use a
+second address-dependent transform after the first one:
+
+    if (s & 1)
+        value = 60 - first
+    else
+        value = ((first & 20) ? a0 : 60) - first
+                - ((first & 1) ? 0 : 2)
+
+All arithmetic is modulo 256.  Structure tokens are recognised at the stage
+used by their format, rather than blindly applying the payload transform to
+every byte.
+
+The level directory at 0200 contains sixteen pointers.  Each points to a
+70-byte block of 56 two-byte entry pointers.  Consecutive entry pairs describe
+two adjacent four-tile-wide columns: the even entry supplies the upper ten
+tile rows and the odd entry supplies the lower sixteen rows.  Each entry points
+to a 0000-terminated list of payload-encoded pointers.  The first four select
+the tile streams; optional fifth and sixth pointers select unresolved seven-
+byte records associated with the six boundaries between the seven screens.
+Each main stream supplies two adjacent tiles per row; four streams therefore
+form the eight tiles across the column pair.  Upper streams contain 20 literal
+cells and lower streams contain 32.  In a level stream, 00 terminates the
+stream, 01 followed by a payload byte changes the current attribute, and all
+other payload bytes are tile codes.  The current attribute is written beside
+every tile code in tilemap RAM.
+
+Object IDs 80-90 select seventeen pointers in the table at 0100.  The selected
+five-byte record is:
+
+    width, destination_low, destination_high, stream_low, stream_high
+
+The object stream is row-major and wraps after the record's width.  Token 5f
+is followed by a payload-encoded attribute; 5e or 60 terminates the stream;
+other bytes are payload-encoded tile codes.  This same format describes both
+title dragons, both flame animation frames and the later-stage moving objects.
+
+ROM text commands use a two-byte pointer table indexed by the command's text
+number.  Text streams use 00 as terminator, 01 followed by an attribute, 02
+followed by a little-endian tilemap position, and literal tile bytes otherwise.
+The fixed HUD uses the same grammar through the pointer at 0140.  Command 0c
+uses an equivalent stream prepared by the Z80 in shared RAM.  Text positions
+advance by two bytes per character and wrap within a 64-tile (0x80-byte) row.
+
+The data format contains the tile codes and palette attributes.  In tilemap
+RAM they are emitted as adjacent bytes, tile first and attribute second.  The
+tile byte supplies code bits 0-7; attribute bits 5-7 supply code bits 8-10 and
+attribute bits 0-4 select the palette.  The separate background-bank latch
+supplies code bit 11.  The solid-colour low tile codes 04-0b in each bank are
+ordinary tiles aligned with the palette colours; they do not require a special
+fill opcode.
+
 
 *******************************************************************************/
 
@@ -123,71 +193,6 @@ several other games in m62.cpp also draw their backgrounds in 4 tile wide strips
 #include "cpu/m6800/m6801.h"
 #include "iremipt.h"
 
-#include "machine/timer.h"
-
-// Inactive HLE reference retained during the experimental 6801 firmware port.
-// The configured machine below uses the real M6801U4 CPU device and ROM.
-class bkungfu_c50_device : public device_t
-{
-public:
-	bkungfu_c50_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock = 0);
-
-	auto vram_w() { return m_vram_w.bind(); }
-	auto level_vram_w() { return m_level_vram_w.bind(); }
-	auto mailbox_out_w() { return m_mailbox_out_w.bind(); }
-	void set_data_rom(const uint8_t *data_rom);
-	void clear();
-	void mailbox_w(offs_t offset, uint8_t data);
-	void command_w(uint8_t command);
-
-protected:
-	virtual void device_start() override ATTR_COLD;
-	virtual void device_reset() override ATTR_COLD;
-
-private:
-	void update_slot(uint8_t slot);
-	void execute_slot(uint8_t slot);
-	void complete(uint16_t offset);
-	void mailbox_out(uint16_t offset, uint8_t data);
-	uint8_t decrypt_data(uint16_t address) const;
-	uint8_t decode_payload(uint16_t address) const;
-	uint16_t decode_payload_word(uint16_t address) const;
-	void draw_object(uint8_t id);
-	void draw_level_strip(int column, int row);
-	void draw_level_column_row(int column, int row, uint8_t tile, uint8_t attr);
-	void draw_text(uint16_t table_offset, bool use_mailbox);
-	void draw_credits_continue();
-	void clear_tilemap();
-	void write_number(int x, int y, uint8_t number);
-	void write_lifebar(int xbase, int ybase, uint8_t energy, bool boss);
-	void write_floor_dot(int which, bool lit);
-
-	devcb_write8 m_vram_w;
-	devcb_write8 m_level_vram_w;
-	devcb_write8 m_mailbox_out_w;
-	const uint8_t *m_data_rom = nullptr;
-	uint8_t m_mailbox[0x800]{};
-	uint16_t m_timer = 0;
-	uint32_t m_p1score = 0;
-	uint32_t m_topscore = 0;
-	uint32_t m_p2score = 0;
-	uint8_t m_lives = 0;
-	uint8_t m_player_energy = 0;
-	uint8_t m_boss_energy = 0;
-	uint8_t m_floorcount = 0;
-	uint8_t m_floorcount_state = 0;
-	uint8_t m_valid = 0;
-	bool m_initialized = false;
-	bool m_running = false;
-	uint8_t m_leveldraw_row = 0;
-	uint8_t m_leveldraw_column = 0;
-	uint8_t m_leveldraw_number = 0;
-	emu_timer *m_leveldraw_timer = nullptr;
-
-	TIMER_CALLBACK_MEMBER(leveldraw_next);
-};
-
-DECLARE_DEVICE_TYPE(BKUNG_C50, bkungfu_c50_device)
 
 namespace {
 
@@ -235,539 +240,6 @@ private:
 };
 
 } // anonymous namespace
-
-DEFINE_DEVICE_TYPE(BKUNG_C50, bkungfu_c50_device, "bkung_c50", "Irem Beyond Kung-Fu C50")
-
-bkungfu_c50_device::bkungfu_c50_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
-	: device_t(mconfig, BKUNG_C50, tag, owner, clock)
-	, m_vram_w(*this)
-	, m_level_vram_w(*this)
-	, m_mailbox_out_w(*this)
-{
-}
-
-void bkungfu_c50_device::device_start()
-{
-	save_item(NAME(m_mailbox));
-	save_item(NAME(m_timer));
-	save_item(NAME(m_p1score));
-	save_item(NAME(m_topscore));
-	save_item(NAME(m_p2score));
-	save_item(NAME(m_lives));
-	save_item(NAME(m_player_energy));
-	save_item(NAME(m_boss_energy));
-	save_item(NAME(m_floorcount));
-	save_item(NAME(m_floorcount_state));
-	save_item(NAME(m_valid));
-	save_item(NAME(m_initialized));
-	save_item(NAME(m_running));
-	save_item(NAME(m_leveldraw_row));
-	save_item(NAME(m_leveldraw_column));
-	save_item(NAME(m_leveldraw_number));
-	m_leveldraw_timer = timer_alloc(FUNC(bkungfu_c50_device::leveldraw_next), this);
-}
-
-void bkungfu_c50_device::device_reset()
-{
-	std::fill(std::begin(m_mailbox), std::end(m_mailbox), 0);
-	m_timer = 0;
-	m_p1score = 0;
-	m_topscore = 0;
-	m_p2score = 0;
-	m_lives = 0;
-	m_player_energy = 0;
-	m_boss_energy = 0;
-	m_floorcount = 0;
-	m_floorcount_state = 0;
-	m_valid = 0;
-	m_initialized = false;
-	m_running = false;
-	m_leveldraw_row = 0;
-	m_leveldraw_column = 0;
-	m_leveldraw_number = 0;
-	m_leveldraw_timer->adjust(attotime::never);
-}
-
-void bkungfu_c50_device::clear()
-{
-	m_initialized = false;
-}
-
-void bkungfu_c50_device::set_data_rom(const uint8_t *data_rom)
-{
-	m_data_rom = data_rom;
-}
-
-uint8_t bkungfu_c50_device::decrypt_data(uint16_t address) const
-{
-	// Recovered C50 data-ROM key.  It belongs to the coprocessor rather than
-	// the Z80-facing driver.  Each external-ROM read is decoded independently;
-	// there is no plaintext image or cipher state retained by the device.
-	static constexpr uint8_t key[256] = {
-	0xae, 0xf3, 0x5c, 0x5d, 0xaa, 0xf7, 0x58, 0x59, 0xa6, 0xfb, 0x54, 0x55, 0xa2, 0xff, 0x50, 0x51,
-	0xbe, 0xe3, 0x4c, 0x4d, 0xba, 0xe7, 0x48, 0x49, 0xb6, 0xeb, 0x44, 0x45, 0xb2, 0xef, 0x40, 0x41,
-	0x8e, 0x13, 0x7c, 0x3d, 0x8a, 0x17, 0x78, 0x39, 0x86, 0x1b, 0x74, 0x35, 0x82, 0x1f, 0x70, 0x31,
-	0x9e, 0x03, 0x6c, 0x2d, 0x9a, 0x07, 0x68, 0x29, 0x96, 0x0b, 0x64, 0x25, 0x92, 0x0f, 0x60, 0x21,
-	0xee, 0x33, 0x1c, 0x1d, 0xea, 0x37, 0x18, 0x19, 0xe6, 0x3b, 0x14, 0x15, 0xe2, 0x3f, 0x10, 0x11,
-	0xfe, 0x23, 0x0c, 0x0d, 0xfa, 0x27, 0x08, 0x09, 0xf6, 0x2b, 0x04, 0x05, 0xf2, 0x2f, 0x00, 0x01,
-	0xce, 0x53, 0x3c, 0xfd, 0xca, 0x57, 0x38, 0xf9, 0xc6, 0x5b, 0x34, 0xf5, 0xc2, 0x5f, 0x30, 0xf1,
-	0xde, 0x43, 0x2c, 0xed, 0xda, 0x47, 0x28, 0xe9, 0xd6, 0x4b, 0x24, 0xe5, 0xd2, 0x4f, 0x20, 0xe1,
-	0x2e, 0x73, 0xdc, 0xdd, 0x2a, 0x77, 0xd8, 0xd9, 0x26, 0x7b, 0xd4, 0xd5, 0x22, 0x7f, 0xd0, 0xd1,
-	0x3e, 0x63, 0xcc, 0xcd, 0x3a, 0x67, 0xc8, 0xc9, 0x36, 0x6b, 0xc4, 0xc5, 0x32, 0x6f, 0xc0, 0xc1,
-	0x0e, 0x93, 0xfc, 0xbd, 0x0a, 0x97, 0xf8, 0xb9, 0x06, 0x9b, 0xf4, 0xb5, 0x02, 0x9f, 0xf0, 0xb1,
-	0x1e, 0x83, 0xec, 0xad, 0x1a, 0x87, 0xe8, 0xa9, 0x16, 0x8b, 0xe4, 0xa5, 0x12, 0x8f, 0xe0, 0xa1,
-	0x6e, 0xb3, 0x9c, 0x9d, 0x6a, 0xb7, 0x98, 0x99, 0x66, 0xbb, 0x94, 0x95, 0x62, 0xbf, 0x90, 0x91,
-	0x7e, 0xa3, 0x8c, 0x8d, 0x7a, 0xa7, 0x88, 0x89, 0x76, 0xab, 0x84, 0x85, 0x72, 0xaf, 0x80, 0x81,
-	0x4e, 0xd3, 0xbc, 0x7d, 0x4a, 0xd7, 0xb8, 0x79, 0x46, 0xdb, 0xb4, 0x75, 0x42, 0xdf, 0xb0, 0x71,
-	0x5e, 0xc3, 0xac, 0x6d, 0x5a, 0xc7, 0xa8, 0x69, 0x56, 0xcb, 0xa4, 0x65, 0x52, 0xcf, 0xa0, 0x61,
-	};
-
-	if (!m_data_rom || address >= 0x8000)
-		return 0xff;
-
-	uint8_t const cipher = m_data_rom[address];
-	if (address < 0x153d)
-		return cipher;
-
-	uint8_t const index = uint8_t((address & 0xff) + (address >> 8));
-	return (index & 1) ? uint8_t(key[index] - cipher) : uint8_t(cipher ^ key[index]);
-}
-
-void bkungfu_c50_device::write_number(int x, int y, uint8_t number)
-{
-	m_vram_w(((y * 0x40 + x) << 1) & 0x0fff, (number & 0x0f) + 0x30);
-}
-
-void bkungfu_c50_device::write_floor_dot(int which, bool lit)
-{
-	m_vram_w(((3 * 0x40 + 0x20 + which * 2) << 1) & 0x0fff, lit ? 0xd5 : 0xd6);
-}
-
-void bkungfu_c50_device::write_lifebar(int xbase, int ybase, uint8_t energy, bool boss)
-{
-	int const full_segments = (energy & 0x78) >> 3;
-	for (int segment = 0; segment < 8; segment++)
-	{
-		uint8_t const part = segment < full_segments ? 8 : segment == full_segments ? energy & 7 : 0;
-		uint8_t const tile = part ? uint8_t((boss ? 0xcc : 0xc4) + 8 - part) : 0xc2;
-		m_vram_w(((ybase * 0x40 + xbase + segment) << 1) & 0x0fff, tile);
-	}
-}
-
-void bkungfu_c50_device::update_slot(uint8_t slot)
-{
-	if (!m_initialized)
-		return;
-
-	switch (slot)
-	{
-	case 0x10:
-		for (int i = 0; i < 6; i++) write_number(0x14 + i, 0, (m_p1score >> ((5 - i) * 4)) & 0x0f);
-		break;
-	case 0x14:
-		for (int i = 0; i < 6; i++) write_number(0x29 + i, 0, (m_p2score >> ((5 - i) * 4)) & 0x0f);
-		break;
-	case 0x18:
-		for (int i = 0; i < 6; i++) write_number(0x1f + i, 0, (m_topscore >> ((5 - i) * 4)) & 0x0f);
-		break;
-	case 0x1c:
-		for (int i = 0; i < 4; i++) write_number(0x25 + i, 5, (m_timer >> ((3 - i) * 4)) & 0x0f);
-		break;
-	case 0x20:
-		for (int i = 0; i < 8; i++) write_floor_dot(i, i <= (int(m_floorcount) - (m_floorcount_state == 0x02)));
-		break;
-	case 0x24:
-		write_number(0x2d, 5, m_lives);
-		break;
-	case 0x28:
-		if (m_player_energy <= 0x40) write_lifebar(0x17, 2, m_player_energy, false);
-		break;
-	case 0x2c:
-		if (m_boss_energy <= 0x40) write_lifebar(0x17, 4, m_boss_energy, true);
-		break;
-	}
-}
-
-void bkungfu_c50_device::complete(uint16_t offset)
-{
-	mailbox_out(offset, 0xfe);
-}
-
-void bkungfu_c50_device::mailbox_out(uint16_t offset, uint8_t data)
-{
-	m_mailbox[offset] = data;
-	m_mailbox_out_w(offset, data);
-}
-
-void bkungfu_c50_device::draw_text(uint16_t table_offset, bool use_mailbox)
-{
-	if (!m_running || !m_data_rom)
-		return;
-
-	uint16_t data_address;
-	const uint8_t *data;
-	uint8_t position_low;
-	uint8_t position_high;
-	uint8_t attribute;
-	if (use_mailbox)
-	{
-		data_address = 0x100;
-		data = m_mailbox;
-		position_low = 3;
-		position_high = 4;
-		attribute = 5;
-	}
-	else
-	{
-		data_address = m_data_rom[table_offset] | (uint16_t(m_data_rom[table_offset + 1]) << 8);
-		data = m_data_rom;
-		position_low = 2;
-		position_high = 3;
-		attribute = 4;
-	}
-
-	for (uint8_t value = data[data_address++]; value != 0; value = data[data_address++])
-	{
-		if (value == 0x01)
-		{
-			mailbox_out(attribute, data[data_address++]);
-		}
-		else if (value == 0x02)
-		{
-			mailbox_out(position_low, data[data_address++]);
-			mailbox_out(position_high, data[data_address++]);
-		}
-		else
-		{
-			uint16_t position = (uint16_t(m_mailbox[position_high]) << 8) | m_mailbox[position_low];
-			m_vram_w(position & 0x0fff, value);
-			m_vram_w((position + 1) & 0x0fff, m_mailbox[attribute]);
-			position = (position & ~0x007f) | ((position + 2) & 0x007f);
-			mailbox_out(position_low, position & 0xff);
-			mailbox_out(position_high, position >> 8);
-		}
-	}
-}
-
-void bkungfu_c50_device::draw_credits_continue()
-{
-	if (!m_running)
-		return;
-
-	uint16_t const position = (uint16_t(m_mailbox[3]) << 8) | m_mailbox[2];
-	uint8_t const attribute = m_mailbox[4];
-	m_vram_w(position & 0x0fff, (m_mailbox[1] >> 4) + 0x30);
-	m_vram_w((position + 1) & 0x0fff, attribute);
-	m_vram_w((position + 2) & 0x0fff, (m_mailbox[1] & 0x0f) + 0x30);
-	m_vram_w((position + 3) & 0x0fff, attribute);
-}
-
-void bkungfu_c50_device::clear_tilemap()
-{
-	if (!m_running)
-		return;
-
-	for (uint16_t position = 0; position < 0x1000; position += 2)
-	{
-		m_vram_w(position, m_mailbox[2]);
-		m_vram_w(position + 1, m_mailbox[1]);
-	}
-}
-
-void bkungfu_c50_device::execute_slot(uint8_t slot)
-{
-	uint8_t const trigger = m_mailbox[slot];
-	uint8_t const p1 = m_mailbox[slot + 1];
-	uint8_t const p2 = m_mailbox[slot + 2];
-	uint8_t const p3 = m_mailbox[slot + 3];
-	switch (slot)
-	{
-	case 0x10: m_p1score = (uint32_t(p1) << 16) | (uint32_t(p2) << 8) | p3; break;
-	case 0x14: m_p2score = (uint32_t(p1) << 16) | (uint32_t(p2) << 8) | p3; break;
-	case 0x18: m_topscore = (uint32_t(p1) << 16) | (uint32_t(p2) << 8) | p3; break;
-	case 0x1c: m_timer = (uint16_t(p1) << 8) | p2; break;
-	case 0x20: m_floorcount = p1; m_floorcount_state = trigger; break;
-	case 0x24: m_lives = p1; break;
-	case 0x28: m_player_energy = p1; break;
-	case 0x2c: m_boss_energy = p1; break;
-	default: return;
-	}
-	m_valid |= uint8_t(1U << ((slot - 0x10) >> 2));
-	update_slot(slot);
-	complete(slot);
-}
-
-void bkungfu_c50_device::mailbox_w(offs_t offset, uint8_t data)
-{
-	if (offset >= std::size(m_mailbox))
-		return;
-
-	m_mailbox[offset] = data;
-	if (m_running && offset >= 0x10 && offset < 0x30 && !(offset & 3))
-		execute_slot(offset);
-}
-
-uint8_t bkungfu_c50_device::decode_payload(uint16_t address) const
-{
-	uint8_t const value = decrypt_data(address);
-	uint8_t const sum = uint8_t((address & 0xff) + (address >> 8));
-	if (sum & 1)
-		return uint8_t(0x60 - value);
-
-	uint8_t const base = (value & 0x20) ? 0xa0 : 0x60;
-	return uint8_t(base - value - ((value & 1) ? 0 : 2));
-}
-
-uint16_t bkungfu_c50_device::decode_payload_word(uint16_t address) const
-{
-	return decode_payload(address) | (uint16_t(decode_payload(address + 1)) << 8);
-}
-
-void bkungfu_c50_device::draw_object(uint8_t id)
-{
-	if (!m_data_rom || id < 0x80 || id > 0x90)
-		return;
-
-	uint16_t const recaddr = decrypt_data(0x100 + 2 * (id - 0x80)) | (uint16_t(decrypt_data(0x100 + 2 * (id - 0x80) + 1)) << 8);
-	if (recaddr == 0 || recaddr >= 0x8000 - 5)
-		return;
-
-	uint8_t const width = decrypt_data(recaddr);
-	uint16_t const pos = (decrypt_data(recaddr + 1) | (uint16_t(decrypt_data(recaddr + 2)) << 8)) & 0xfff;
-	uint16_t dataptr = decrypt_data(recaddr + 3) | (uint16_t(decrypt_data(recaddr + 4)) << 8);
-	if (width == 0 || width > 0x20 || dataptr >= 0x8000)
-		return;
-
-	uint8_t attrs[512], tiles[512];
-	int count = 0;
-	uint8_t attr = 0;
-	while (dataptr < 0x8000 && count < 512)
-	{
-		uint16_t const address = dataptr;
-		uint8_t const value = decrypt_data(dataptr++);
-		if (value == 0x5f)
-		{
-			if (dataptr >= 0x8000)
-				break;
-			attr = decode_payload(dataptr++);
-			continue;
-		}
-		if (value == 0x5e || value == 0x60)
-			break;
-		tiles[count] = decode_payload(address);
-		attrs[count] = attr;
-		count++;
-	}
-
-	for (int cell = 0; cell < count; cell++)
-	{
-		int const column = cell % width;
-		int const row = cell / width;
-		uint16_t const destination = (pos + row * 0x80 + column * 2) & 0xfff;
-		m_vram_w(destination, tiles[cell]);
-		m_vram_w(destination + 1, attrs[cell]);
-	}
-}
-
-void bkungfu_c50_device::draw_level_column_row(int column, int row, uint8_t tile, uint8_t attr)
-{
-	int const offset = ((row + 6) * 256 + column * 4) * 2;
-	for (int x = 0; x < 4; x++)
-	{
-		m_level_vram_w(offset + x * 2, tile);
-		m_level_vram_w(offset + x * 2 + 1, attr);
-	}
-}
-
-void bkungfu_c50_device::draw_level_strip(int column, int row)
-{
-	if (!m_data_rom)
-		return;
-
-	draw_level_column_row(column, row, 0x05, 0x19);
-	int const source_entry = (column & ~1) + ((row >= 10) ? 1 : 0);
-	int const source_row = (row < 10)
-		? row + ((column & 1) ? 10 : 0)
-		: row - 10 + ((column & 1) ? 16 : 0);
-	uint16_t const table = 0x200 + ((m_leveldraw_number & 0x0f) << 1);
-	uint16_t const block = decrypt_data(table) | (uint16_t(decrypt_data(table + 1)) << 8);
-	uint16_t const entry = block + source_entry * 2;
-	if (block < 0x153d || entry >= 0x8000 - 1)
-		return;
-
-	uint16_t const record = decode_payload_word(entry);
-	if (record < 0x1aed || record >= 0x8000 - 8)
-		return;
-
-	uint8_t tiles[4][64];
-	uint8_t attrs[4][64];
-	int count = -1;
-	for (int stream = 0; stream < 4; stream++)
-	{
-		uint16_t dataptr = decode_payload_word(record + stream * 2);
-		if (dataptr < 0x2349 || dataptr >= 0x8000)
-			return;
-
-		uint8_t attr = 0;
-		int streamcount = 0;
-		while (dataptr < 0x8000 && streamcount < 64)
-		{
-			uint8_t const value = decode_payload(dataptr++);
-			if (value == 0x00)
-				break;
-			if (value == 0x01)
-			{
-				if (dataptr >= 0x8000)
-					return;
-				attr = decode_payload(dataptr++);
-				continue;
-			}
-			tiles[stream][streamcount] = value;
-			attrs[stream][streamcount] = attr;
-			streamcount++;
-		}
-
-		if (count < 0)
-			count = streamcount;
-		else if (count != streamcount)
-			return;
-	}
-
-	int const expected_count = (source_entry & 1) ? 32 : 20;
-	if (count != expected_count)
-		return;
-
-	int const halfheight = count / 2;
-	int const band = source_row / halfheight;
-	int const bandrow = source_row % halfheight;
-	int const offset = ((row + 6) * 256 + column * 4) * 2;
-	for (int x = 0; x < 4; x++)
-	{
-		int const stream = band * 2 + x / 2;
-		int const index = bandrow * 2 + x % 2;
-		m_level_vram_w(offset + x * 2, tiles[stream][index]);
-		m_level_vram_w(offset + x * 2 + 1, attrs[stream][index]);
-	}
-}
-
-TIMER_CALLBACK_MEMBER(bkungfu_c50_device::leveldraw_next)
-{
-	draw_level_strip(m_leveldraw_column, m_leveldraw_row);
-	if (++m_leveldraw_row == 26)
-	{
-		m_leveldraw_row = 0;
-		m_leveldraw_column++;
-	}
-	if (m_leveldraw_column != 0x38)
-		m_leveldraw_timer->adjust(attotime::from_usec(200));
-	else
-		complete(0);
-}
-
-void bkungfu_c50_device::command_w(uint8_t command)
-{
-	if (command == 0xfe)
-	{
-		m_running = true;
-		for (uint8_t slot = 0x10; slot <= 0x2c; slot += 4)
-			complete(slot);
-		complete(0x102);
-		complete(0x106);
-		complete(0x118);
-		complete(0x11c);
-		complete(0);
-		return;
-	}
-	if (command == 0x08)
-	{
-		clear_tilemap();
-		clear();
-		complete(0);
-		return;
-	}
-	if (command == 0x14 || command == 0x0d)
-	{
-		draw_text(uint16_t(m_mailbox[1]) << 1, false);
-		complete(0);
-		return;
-	}
-	if (command == 0x0c)
-	{
-		draw_text(0, true);
-		complete(0);
-		return;
-	}
-	if (command == 0x10)
-	{
-		draw_credits_continue();
-		complete(0);
-		return;
-	}
-	if (command == 0x05)
-	{
-		// Observed after command 0x0f for later-stage animation objects.
-		// Its additional effect, if any, is not known yet.
-		complete(0);
-		return;
-	}
-	if (command == 0x01)
-	{
-		m_leveldraw_number = m_mailbox[1];
-		complete(0);
-		return;
-	}
-	if (command == 0x02)
-	{
-		m_leveldraw_row = 0;
-		m_leveldraw_column = 0;
-		m_leveldraw_timer->adjust(attotime::from_usec(200));
-		return;
-	}
-	if (command == 0x0f)
-	{
-		draw_object(m_mailbox[1]);
-		complete(0);
-		return;
-	}
-	if (command != 0x0a)
-		return;
-
-	// Pre-level setup: decode the ROM-described base HUD.  This is an
-	// explicit C50 command, not a completion synthesized by the Z80 driver.
-	if (!m_data_rom)
-		return;
-
-	uint16_t stream = m_data_rom[0x140] | (uint16_t(m_data_rom[0x141]) << 8);
-	uint16_t position = 0;
-	uint8_t attribute = 0;
-	for (;;)
-	{
-		uint8_t const value = m_data_rom[stream++];
-		if (value == 0x00)
-			break;
-		if (value == 0x01)
-		{
-			attribute = m_data_rom[stream++];
-			continue;
-		}
-		if (value == 0x02)
-		{
-			uint8_t const low = m_data_rom[stream++];
-			uint8_t const high = m_data_rom[stream++];
-			position = low | (uint16_t(high) << 8);
-			continue;
-		}
-		m_vram_w(position & 0x0fff, value);
-		m_vram_w((position + 1) & 0x0fff, attribute);
-		position = (position & ~0x007f) | ((position + 2) & 0x007f);
-	}
-
-	m_initialized = true;
-	for (uint8_t slot = 0x10; slot <= 0x2c; slot += 4)
-		if (m_valid & (1U << ((slot - 0x10) >> 2)))
-			update_slot(slot);
-	complete(0);
-}
 
 namespace {
 
@@ -945,8 +417,8 @@ void m62_bkungfu_state::bkungfu_blitter_w(offs_t offset, uint8_t data)
 			uint8_t param2 = m_blittercmdram[0x002];
 			logerror("%s: Command %02x: blitter: start of level cmd 2 (do draw?) %02x %02x\n", machine().describe_context(), data, param1, param2);
 
-			// The C50 device owns the progressive strip draw and completes C800
-			// when its last 4-tile column has been written.
+			// The 6801 firmware owns the progressive strip draw and completes C800
+			// after its last 4-tile column has been written.
 		}
 		else if (data == 0x01)
 		{
@@ -996,7 +468,7 @@ void m62_bkungfu_state::bkungfu_blitter_w(offs_t offset, uint8_t data)
 			// definitions are either coming from internal MCU ROM or the encrypted area
 
 			logerror("%s: Command %02x: blitter: draw title animation element (flames / level animations) %02x %02x\n", machine().describe_context(), data, m_blittercmdram[0x001], m_blittercmdram[0x002]);
-			// The C50 device decodes the object record and writes its tilemap.
+			// The 6801 firmware decodes the object record and writes its tilemap.
 		}
 		else if (data == 0xfe)
 		{
@@ -1076,8 +548,8 @@ void m62_bkungfu_state::bkungfu_blitter_w(offs_t offset, uint8_t data)
 			}
 			}
 
-			// The C50 sees the same shared RAM writes.  Its mailbox model runs
-			// this job when it sees the trigger byte and writes 0xfe on completion.
+			// The 6801 sees the same shared RAM writes.  Its firmware runs this
+			// job when it sees the trigger byte and writes 0xfe on completion.
 		}
 
 	}
