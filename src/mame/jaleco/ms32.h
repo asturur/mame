@@ -103,6 +103,17 @@ protected:
 	required_device<gfxdecode_device> m_gfxdecode;
 	required_device<ymf271_device> m_ymf;
 
+	memory_share_creator<u8> m_priram;
+	required_shared_ptr<u32> m_roz_ctrl;
+	memory_share_creator<u16> m_rozram;
+	memory_share_creator<u16> m_lineram;
+	memory_share_creator<u16> m_txram;
+	bitmap_ind16 m_temp_bitmap_tilemaps;
+	bitmap_ind16 m_temp_bitmap_sprites;
+	bitmap_ind16 m_layer_tx;
+	bitmap_ind16 m_layer_bg;
+	bitmap_ind16 m_layer_roz;
+
 	void flipscreen_w(int state);
 	virtual void video_start() override ATTR_COLD;
 	virtual void draw_tile_layers(screen_device &screen, const rectangle &cliprect);
@@ -113,14 +124,6 @@ protected:
 	tilemap_t *bg_layer_tilemap() const { return (m_tilemaplayoutcontrol & 1) ? m_bg_tilemap_alt : m_bg_tilemap; }
 	virtual tilemap_t &create_tx_tilemap() ATTR_COLD;
 	TILE_GET_INFO_MEMBER(get_ms32_roz_tile_info);
-
-	memory_share_creator<u8> m_priram;
-	required_shared_ptr<u32> m_roz_ctrl;
-	memory_share_creator<u16> m_rozram;
-	memory_share_creator<u16> m_lineram;
-	memory_share_creator<u16> m_txram;
-	bitmap_ind16 m_temp_bitmap_tilemaps;
-	bitmap_ind16 m_temp_bitmap_sprites;
 
 	void ms32_map(address_map &map) ATTR_COLD;
 	void ms32_sound_map(address_map &map) ATTR_COLD;
@@ -144,11 +147,15 @@ private:
 	tilemap_t *m_bg_tilemap;
 	tilemap_t *m_bg_tilemap_alt;
 	u32 m_tilemaplayoutcontrol;
-	bitmap_ind8 m_temp_bitmap_sprites_pri;
+	bitmap_ind16 m_temp_bitmap_sprites_pri;
 	u32 m_brt[4];
 	int m_brt_r;
 	int m_brt_g;
 	int m_brt_b;
+	int m_brt1_r;
+	int m_brt1_g;
+	int m_brt1_b;
+
 	u8 ms32_nvram_r8(offs_t offset);
 	void ms32_nvram_w8(offs_t offset, u8 data);
 	u8 ms32_priram_r8(offs_t offset);
@@ -178,6 +185,7 @@ private:
 	void screen_vblank(int state);
 	void update_color(int color);
 	void draw_sprites(bitmap_ind16 &bitmap, bitmap_ind8 &bitmap_pri, const rectangle &cliprect, u16 *sprram_top);
+	void apply_sprite_effects(screen_device &screen, bitmap_rgb32 &bitmap, const rectangle &cliprect);
 	void draw_roz(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect,int priority);
 };
 
@@ -211,12 +219,9 @@ private:
 	required_shared_ptr<u32> m_road_ctrl;
 	memory_share_creator<u16> m_road_lineram;
 	std::vector<u16> m_txram_latch;
-	bitmap_ind16 m_layer_tx;
-	bitmap_ind16 m_layer_bg;
 	bitmap_ind16 m_layer_road;
-	bitmap_ind16 m_layer_roz;
 
-	tilemap_t* m_extra_tilemap;
+	tilemap_t *m_extra_tilemap;
 
 	void draw_line_plane(screen_device &screen, bitmap_ind16 &bitmap, const rectangle &cliprect, tilemap_t *tilemap, u16 const *vram, u16 const *lineram, u32 const *ctrl, bool wrap, u16 *line_colour);
 
