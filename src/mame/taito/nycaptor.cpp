@@ -330,6 +330,10 @@ public:
 	void init_colt() ATTR_COLD;
 	void init_bronx() ATTR_COLD;
 
+protected:
+	virtual void machine_start() override ATTR_COLD;
+	virtual void machine_reset() override ATTR_COLD;
+
 private:
 	uint8_t mcu_status_r();
 	uint8_t mcu_r();
@@ -337,11 +341,21 @@ private:
 	uint8_t mcu_status_r1();
 	void generic_control_w(uint8_t data);
 
+	void mcu_process_command();
+
 	void bronx_master_map(address_map &map) ATTR_COLD;
 	void bronx_slave_io_map(address_map &map) ATTR_COLD;
 	void bronx_slave_map(address_map &map) ATTR_COLD;
 	void cyclshtg_master_map(address_map &map) ATTR_COLD;
 	void cyclshtg_slave_map(address_map &map) ATTR_COLD;
+
+	uint8_t m_mcu_cmd = 0;
+	uint8_t m_mcu_param_idx = 0;
+	uint8_t m_mcu_params[4]{};
+	uint8_t m_mcu_response[2]{};
+	uint8_t m_mcu_resp_idx = 0;
+	uint8_t m_mcu_resp_count = 0;
+	bool m_mcu_has_data = false;
 };
 
 
@@ -751,21 +765,128 @@ void nycaptor_state::sound_map(address_map &map)
 }
 
 
-// Cycle Shooting
+// Cycle Shooting — MCU simulation
+//
+// The original 68705 MCU dump is missing.  The Z80 code uses four commands
+// whose expected behaviour was reverse-engineered from the Bronx bootleg
+// (which stripped the MCU and patched the main ROM):
+//
+//   $0c — init handshake, returns a single ack byte
+//   $14 — stage difficulty value: cmd + stage index, returns one byte
+//          (bronx lookup table: 20,30,40,50,60,70,73,65,84)
+//   $17 — game-state query: cmd + data byte, returns one byte
+//   $35 — ROM-pointer protection: cmd + 3 data bytes, returns 2 bytes (HL)
+//          (bronx hardcodes the result to $8f44; the Z80 fallback path
+//           computes HL = DE + A*2 as a word-table lookup)
 
 
 uint8_t cyclshtg_state::mcu_status_r()
 {
-	return 0xff;
+	// $d805 bit 1 — MCU has sent data to the main CPU
+	// $d807 bit 0 — MCU is ready to receive data from main CPU
+	// both bits are checked via the same handler at different addresses
+	// bit 2+ must read high — the startup hw test at $0858 checks bit 2
+	return (m_mcu_has_data ? 0x02 : 0x00) | 0xfd;
 }
 
 uint8_t cyclshtg_state::mcu_r()
 {
-	return 7;
+	if (!m_mcu_has_data)
+		return 0x00;
+
+	uint8_t const result = m_mcu_response[m_mcu_resp_idx];
+	m_mcu_resp_idx++;
+	if (m_mcu_resp_idx >= m_mcu_resp_count)
+		m_mcu_has_data = false;
+
+	return result;
 }
 
 void cyclshtg_state::mcu_w(uint8_t data)
 {
+	if (m_mcu_cmd == 0)
+	{
+		m_mcu_cmd = data;
+		m_mcu_param_idx = 0;
+
+		switch (m_mcu_cmd)
+		{
+		case 0x0c:
+			mcu_process_command();
+			break;
+		case 0x14:
+		case 0x17:
+			// need 1 parameter byte
+			break;
+		case 0x35:
+			// need 3 parameter bytes
+			break;
+		default:
+			logerror("MCU: unknown command %02x\n", m_mcu_cmd);
+			m_mcu_cmd = 0;
+			break;
+		}
+	}
+	else
+	{
+		m_mcu_params[m_mcu_param_idx++] = data;
+
+		int params_needed = 0;
+		switch (m_mcu_cmd)
+		{
+		case 0x14: params_needed = 1; break;
+		case 0x17: params_needed = 1; break;
+		case 0x35: params_needed = 3; break;
+		}
+
+		if (m_mcu_param_idx >= params_needed)
+			mcu_process_command();
+	}
+}
+
+void cyclshtg_state::mcu_process_command()
+{
+	static const uint8_t stage_table[9] = {
+		0x14, 0x1e, 0x28, 0x32, 0x3c, 0x46, 0x49, 0x41, 0x54
+	};
+
+	m_mcu_resp_idx = 0;
+
+	switch (m_mcu_cmd)
+	{
+	case 0x0c:
+		m_mcu_response[0] = 0x07;
+		m_mcu_resp_count = 1;
+		break;
+
+	case 0x14:
+	{
+		uint8_t const stage = m_mcu_params[0];
+		m_mcu_response[0] = (stage < std::size(stage_table)) ? stage_table[stage] : 0x00;
+		m_mcu_resp_count = 1;
+		break;
+	}
+
+	case 0x17:
+		m_mcu_response[0] = m_mcu_params[0];
+		m_mcu_resp_count = 1;
+		break;
+
+	case 0x35:
+	{
+		// the Z80 fallback path computes HL = DE + A*2, bronx hardcodes $8f44
+		uint8_t const idx = m_mcu_params[0];
+		uint16_t const de = (uint16_t(m_mcu_params[2]) << 8) | m_mcu_params[1];
+		uint16_t const result = de + idx * 2;
+		m_mcu_response[0] = result & 0xff;
+		m_mcu_response[1] = result >> 8;
+		m_mcu_resp_count = 2;
+		break;
+	}
+	}
+
+	m_mcu_has_data = true;
+	m_mcu_cmd = 0;
 }
 
 uint8_t cyclshtg_state::mcu_status_r1()
@@ -1666,6 +1787,32 @@ ROM_START( colt )
 	ROM_LOAD( "a50_12",   0x18000, 0x4000, CRC(3fb4cfa3) SHA1(b1c5f7b0297c59dc93420d31e0ef2b1125dbb9db) )
 	ROM_LOAD( "a50_14",   0x1c000, 0x4000, CRC(24b2f1bf) SHA1(4757aec2e4b99ce33d993ce1e19ee46a4eb76e86) )
 ROM_END
+
+void cyclshtg_state::machine_start()
+{
+	nycaptor_state::machine_start();
+
+	save_item(NAME(m_mcu_cmd));
+	save_item(NAME(m_mcu_param_idx));
+	save_item(NAME(m_mcu_params));
+	save_item(NAME(m_mcu_response));
+	save_item(NAME(m_mcu_resp_idx));
+	save_item(NAME(m_mcu_resp_count));
+	save_item(NAME(m_mcu_has_data));
+}
+
+void cyclshtg_state::machine_reset()
+{
+	nycaptor_state::machine_reset();
+
+	m_mcu_cmd = 0;
+	m_mcu_param_idx = 0;
+	std::fill(std::begin(m_mcu_params), std::end(m_mcu_params), 0);
+	std::fill(std::begin(m_mcu_response), std::end(m_mcu_response), 0);
+	m_mcu_resp_idx = 0;
+	m_mcu_resp_count = 0;
+	m_mcu_has_data = false;
+}
 
 void nycaptor_state::init_nycaptor()
 {
