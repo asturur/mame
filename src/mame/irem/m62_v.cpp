@@ -401,9 +401,9 @@ uint32_t m62_state::screen_update_kungfum(screen_device &screen, bitmap_rgb32 &b
 	{
 		m_bg_tilemap->set_scrollx(i, m_m62_background_hscroll);
 	}
-	m_bg_tilemap->draw(screen, bitmap, cliprect, 0, 0);
+	m_bg_tilemap->draw(screen, bitmap, cliprect, m_bg_tilemap_drawflags[0], 0);
 	draw_sprites(bitmap, cliprect, 0x1f, 0x00, 0x00);
-	m_bg_tilemap->draw(screen, bitmap, cliprect, 1, 0);
+	m_bg_tilemap->draw(screen, bitmap, cliprect, m_bg_tilemap_drawflags[1], 0);
 	return 0;
 }
 

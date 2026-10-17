@@ -61,6 +61,7 @@ protected:
 	required_device<irem_audio_device> m_audio;
 
 	tilemap_t*             m_bg_tilemap = nullptr;
+	uint32_t              m_bg_tilemap_drawflags[2] = { 0, 1 };
 	uint8_t                m_kidniki_background_bank = 0;
 
 	void m62_flipscreen_w(uint8_t data);

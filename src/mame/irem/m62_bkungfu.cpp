@@ -9,6 +9,7 @@ video reference: https://www.youtube.com/watch?v=Efr9EQkbCSQ
 
 	TODO:
 	- priority issue with main sprite against steps at the end of some stages
+	- priority of pop-up messages
 
 *******************************************************************************/
 
@@ -60,19 +61,27 @@ TILE_GET_INFO_MEMBER(m62_bkungfu_state::get_bkungfu_bg_tile_info)
 
 	tileinfo.set(0, code | ((color & 0xe0) << 3) | (m_kidniki_background_bank << 11), color & 0x1f, 0);
 
-	// The title flame uses palette pair 0x0d and is visibly behind the player
-	// sprite in the reference footage.  Beyond Kung-Fu therefore has the M62
-	// tile-priority threshold strapped one step above Kung-Fu Master: only
-	// palette pairs 0x0e-0x0f (colors 0x1c-0x1f) cover sprites.
-	if ((tile_index / 256) < 6 || ((color & 0x1f) >> 1) > 0x0d)
-		tileinfo.category = 1;
+	// Palettes 0x1c-0x1f contain foreground detail, but their low pens also
+	// draw sky gaps, closed trapdoors and stairs that must remain behind sprites.
+	// The title flame (palette 0x1a) stays entirely behind sprites.
+	if ((tile_index / 256) < 6)
+		tileinfo.group = 2;
+	else if ((color & 0x1c) == 0x1c)
+		tileinfo.group = 1;
 	else
-		tileinfo.category = 0;
+		tileinfo.group = 0;
 }
 
 void m62_bkungfu_state::video_start()
 {
 	m62_start(tilemap_get_info_delegate(*this, FUNC(m62_bkungfu_state::get_bkungfu_bg_tile_info)), 32, 0, 8, 8, 256, 32);
+
+	// Draw background pens before sprites and foreground pens afterwards.
+	m_bg_tilemap_drawflags[0] = TILEMAP_DRAW_LAYER1;
+	m_bg_tilemap_drawflags[1] = TILEMAP_DRAW_LAYER0;
+	m_bg_tilemap->set_transmask(0, 0xff, 0x00); // all pens behind sprites
+	m_bg_tilemap->set_transmask(1, 0x0f, 0xf0); // pens 0-3 behind, 4-7 in front
+	m_bg_tilemap->set_transmask(2, 0x00, 0xff); // HUD entirely in front
 }
 
 
