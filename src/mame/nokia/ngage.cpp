@@ -24,6 +24,7 @@
 #include "ngage_bt.h"
 #include "ngage_mmc.h"
 #include "ngage_pcm.h"
+#include "ngage_qd_lcd.h"
 #include "ngage_rtc.h"
 #include "ngage_sim.h"
 
@@ -44,6 +45,7 @@
 namespace {
 
 constexpr u32 NOR_SIZE = 0x800000;
+constexpr u32 QD_CS0_SIZE = 0x1000000;
 constexpr u32 PMM_SIZE = 0x10000;
 constexpr u32 CDRIVE_SIZE = 0x400000;
 constexpr u32 UPP_BASE = 0x0c100000;
@@ -128,12 +130,15 @@ public:
 		, m_mmc(*this, "mmc")
 		, m_rtc(*this, "rtc")
 		, m_pcm(*this, "pcm")
+		, m_qd_lcd(*this, "qd_lcd")
 		, m_sim(*this, "sim")
 		, m_config(*this, "CONFIG")
 	{
 	}
 
 	void nem4(machine_config &config) ATTR_COLD;
+	void qd(machine_config &config) ATTR_COLD;
+	void init_qd() { m_is_qd = true; }
 	DECLARE_INPUT_CHANGED_MEMBER(key_changed);
 
 protected:
@@ -142,6 +147,9 @@ protected:
 
 private:
 	void nem4_map(address_map &map) ATTR_COLD;
+	void qd_map(address_map &map) ATTR_COLD;
+	void common_map(address_map &map) ATTR_COLD;
+	u32 cs0_size() const { return m_is_qd ? QD_CS0_SIZE : NOR_SIZE; }
 	template <unsigned Chip> u16 flash_r(offs_t offset);
 	template <unsigned Chip> void flash_w(offs_t offset, u16 data, u16 mem_mask);
 	template <unsigned Chip> u8 *flash_storage(u32 addr);
@@ -184,7 +192,7 @@ private:
 	TIMER_CALLBACK_MEMBER(mdi_announce);
 	TIMER_CALLBACK_MEMBER(uem_tick);
 
-	enum : u8 { ARRAY, IDENTIFY, STATUS, PROTECTION };
+	enum : u8 { ARRAY, IDENTIFY, STATUS, PROTECTION, CFI };
 	enum : u8 { IDLE, AMD_PROGRAM, AMD_ERASE, INTEL_PROGRAM, INTEL_ERASE };
 
 	required_device<arm920t_cpu_device> m_maincpu;
@@ -196,9 +204,11 @@ private:
 	required_device<ngage_mmc_device> m_mmc;
 	required_device<ngage_rtc_device> m_rtc;
 	required_device<ngage_pcm_device> m_pcm;
+	optional_device<ngage_qd_lcd_device> m_qd_lcd;
 	required_device<ngage_sim_device> m_sim;
 	required_ioport m_config;
 
+	bool m_is_qd = false;
 	std::vector<u16> m_decoded_nos;
 	u32 m_nos_start = 0;
 	u32 m_nos_end = 0;
@@ -292,7 +302,7 @@ void ngage_state::machine_start()
 
 	u32 const first = word32(0x174);
 	u32 const end = word32(0x178);
-	if (!((first | end) & 0xfff) && first < end && end <= NOR_SIZE)
+	if (!((first | end) & 0xfff) && first < end && end <= cs0_size())
 	{
 		m_nos_start = first;
 		m_nos_end = end;
@@ -383,7 +393,8 @@ void ngage_state::machine_reset()
 	m_maincpu->set_unscaled_clock(ARM_SDRAM_CLOCK + (half_steps <= 4 ? half_steps : 0) * (ARM_SDRAM_CLOCK / 2));
 
 	finish_cdrive_erase();
-	recover_calendar_mirror();
+	if (!m_is_qd)
+		recover_calendar_mirror();
 	std::fill(std::begin(m_flash_mode), std::end(m_flash_mode), ARRAY);
 	std::fill(std::begin(m_flash_unlock), std::end(m_flash_unlock), 0);
 	std::fill(std::begin(m_flash_operation), std::end(m_flash_operation), IDLE);
@@ -442,8 +453,8 @@ void ngage_state::machine_reset()
 template <unsigned Chip>
 u8 *ngage_state::flash_storage(u32 addr)
 {
-	if (Chip == 0 && addr >= NOR_SIZE - PMM_SIZE)
-		return &m_pmm[addr - (NOR_SIZE - PMM_SIZE)];
+	if (Chip == 0 && addr >= cs0_size() - PMM_SIZE)
+		return &m_pmm[addr - (cs0_size() - PMM_SIZE)];
 	if (Chip == 1 && addr >= NOR_SIZE - CDRIVE_SIZE)
 		return &m_cdrive[addr - (NOR_SIZE - CDRIVE_SIZE)];
 	return nullptr;
@@ -456,6 +467,15 @@ u16 ngage_state::flash_r(offs_t offset)
 	switch (m_flash_mode[Chip])
 	{
 	case IDENTIFY:
+		if (m_is_qd)
+		{
+			switch (addr & 0x1ff)
+			{
+			case 0x00: return 0x00ec;
+			case 0x02: return Chip == 0 ? 0x22f8 : 0x22fa;
+			default: return 0;
+			}
+		}
 		switch (Chip == 1 && addr >= NOR_SIZE - CDRIVE_SIZE ? addr & 0x0f : addr)
 		{
 		case 0x00: return 0x0001;
@@ -467,6 +487,14 @@ u16 ngage_state::flash_r(offs_t offset)
 		}
 	case STATUS:
 		return 0x0080;
+	case CFI:
+	{
+		static constexpr u8 query[] = { 'Q', 'R', 'Y', 2, 0, 0x40 };
+		u32 const word = offset & 0xff;
+		if (word >= 0x10 && word < 0x10 + std::size(query))
+			return query[word - 0x10];
+		return word == 0x27 ? (Chip == 0 ? 24 : 23) : 0;
+	}
 	case PROTECTION:
 		if ((addr >> 21) == m_flash_protection_bank[Chip])
 			return 1;
@@ -479,7 +507,7 @@ u16 ngage_state::flash_r(offs_t offset)
 	if (u8 const *const storage = flash_storage<Chip>(addr))
 		return storage[0] | (storage[1] << 8);
 
-	u32 const index = Chip * NOR_SIZE + addr;
+	u32 const index = Chip == 0 ? addr : cs0_size() + (Chip - 1) * NOR_SIZE + addr;
 	return m_flash[index] | (m_flash[index + 1] << 8);
 }
 
@@ -525,9 +553,12 @@ void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
 	u8 &mode = m_flash_mode[Chip];
 	u8 &operation = m_flash_operation[Chip];
 	u8 *const storage = flash_storage<Chip>(addr);
-	u32 const sector_size = Chip == 0 || (addr & 0x1fffff) >= 0x1f0000 ? 0x4000 : 0x10000;
+	u32 const chip_size = Chip == 0 ? cs0_size() : NOR_SIZE;
+	u32 const sector_size = m_is_qd ? (addr >= chip_size - PMM_SIZE ? 0x2000 : 0x10000)
+		: (Chip == 0 || (addr & 0x1fffff) >= 0x1f0000 ? 0x4000 : 0x10000);
 	u32 const sector = addr & ~(sector_size - 1);
-	u32 const command_address = addr & 0x7ff;
+	u32 const command_address = addr & (m_is_qd ? 0xfff : 0x7ff);
+	u32 const unlock_address = m_is_qd ? 0xaaa : 0x2aa;
 
 	if (mem_mask != 0xffff)
 		return;
@@ -566,15 +597,17 @@ void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
 		operation = IDLE;
 		m_flash_amd_tail[Chip] = false;
 	}
-	else if (command_address == 0x2aa && data == 0xaa)
+	else if (command_address == unlock_address && data == 0xaa)
 		m_flash_unlock[Chip] = 1;
 	else if (unlock == 1 && command_address == 0x554 && data == 0x55)
 		m_flash_unlock[Chip] = 2;
-	else if (unlock == 2 && command_address == 0x2aa && data == 0xa0)
+	else if (unlock == 2 && command_address == unlock_address && data == 0xa0)
 		operation = AMD_PROGRAM;
-	else if (unlock == 2 && command_address == 0x2aa && data == 0x80)
+	else if (unlock == 2 && command_address == unlock_address && data == 0x80)
 		operation = AMD_ERASE;
-	else if (data == 0x90 && ((unlock == 2 && command_address == 0x2aa) || (!unlock && (addr == 0 || addr == 0xaaaa))))
+	else if (m_is_qd && command_address == 0xaa && data == 0x98)
+		mode = CFI;
+	else if (data == 0x90 && ((unlock == 2 && command_address == unlock_address) || (!unlock && (addr == 0 || addr == 0xaaaa))))
 		mode = IDENTIFY;
 	else if (unlock == 2 && (offset & 0xfff) == 0x555 && data == 0xc0)
 	{
@@ -585,7 +618,7 @@ void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
 		mode = STATUS;
 	else if (data == 0x50)
 		mode = ARRAY;
-	else if (data == 0x60)
+	else if (!m_is_qd && data == 0x60)
 	{
 		mode = PROTECTION;
 		m_flash_protection_bank[Chip] = addr >> 21;
@@ -763,10 +796,10 @@ u16 ngage_state::uem_r(u8 reg) const
 	}
 	switch (reg)
 	{
-	case 0x24: return m_uem_rtc_calibration_written ? m_uem_regs[reg] : 1;
+	case 0x24: return m_uem_rtc_calibration_written ? m_uem_regs[reg] : (m_is_qd ? 0xc0 : 1);
 	case 0x35: return m_uem_alarm_status | ((!m_power_key_released || BIT(m_keys, 26)) ? 0x10 : 0);
 	case 0x3a: return m_uem_adc_result;
-	case 0x3f: return (!m_power_key_released || BIT(m_keys, 26)) ? 2 : 0;
+	case 0x3f: return (m_is_qd ? 0x0800 : 0) | ((!m_power_key_released || BIT(m_keys, 26)) ? 2 : 0);
 	case 0x80: return 0x0400;
 	default:   return m_uem_regs[reg];
 	}
@@ -1022,11 +1055,12 @@ void ngage_state::lcd_dma_start(unsigned channel)
 	u32 const destination = registers[8];
 	u64 const words = u64(registers[11]) + 1;
 	bool const sdram = source >= 0x0a000000 && u64(source) + words * 4 <= 0x0b000000;
+	bool const panel_ready = m_qd_lcd ? m_qd_lcd->dma_ready(words)
+		: (m_lcd_pixel_header && m_lcd_write && m_lcd_cursor < m_lcd_limit && words <= m_lcd_limit - m_lcd_cursor);
 	if (registers[2] != 2 || registers[1] != 1 || request != 7 || !sdram || (source & 3)
 			|| registers[6] != 4 || registers[7] != 32 || registers[9] != 0 || registers[10] != 32
 			|| (destination != 0x10121208 && destination != 0x0c121208)
-			|| !m_lcd_pixel_header || !m_lcd_write || m_lcd_cursor >= m_lcd_limit
-			|| words > m_lcd_limit - m_lcd_cursor)
+			|| !panel_ready)
 	{
 		logerror("%s: unsupported UPP DMA channel %u transfer %08x to %08x (%u words)\n",
 			machine().describe_context(), channel, source, destination, words);
@@ -1037,7 +1071,13 @@ void ngage_state::lcd_dma_start(unsigned channel)
 	// transfer time of the 16-bit SDRAM interface, clocked 1:1 with the ARM.
 	address_space &program = m_maincpu->space(AS_PROGRAM);
 	for (u32 n = 0; n < words; ++n)
-		lcd_data_w(program.read_dword(source + n * 4));
+	{
+		u32 const word = program.read_dword(source + n * 4);
+		if (m_qd_lcd)
+			m_qd_lcd->write(2, word);
+		else
+			lcd_data_w(word);
+	}
 	m_lcd_dma_timer[channel]->adjust(attotime::from_ticks(words * 2, m_maincpu->unscaled_clock()), channel);
 }
 
@@ -1056,32 +1096,56 @@ ngage_state::keypad_levels ngage_state::keypad_read() const
 	u8 const column_low = m_key_column_drive & ~column_data;
 	u8 rows = ~row_low & 0x1f;
 	u8 columns = ~column_low & 0x3f;
-	for (unsigned column = 0; column < 6; ++column)
+	if (m_is_qd)
 	{
-		unsigned const first = column < 2 ? 5 + column * 2 : 9 + (column - 2) * 3;
-		unsigned const first_row = column < 2 ? 0 : 2;
-		unsigned const row_count = column < 2 ? 2 : 3;
-		for (unsigned i = 0; i < row_count; ++i)
+		// QD ekeyb table 3. Port D drives its five columns and port E
+		// reads its six rows. The classic N-Gage scans the other way.
+		static constexpr s8 positions[] = {
+			 0,  5,  1,  6,  9, 10,  4,  3, -1,  2, 27, 19, 12,
+			28, 24, 29, 17, 13, 18, 14, 22,  8, 23, 15,  7
+		};
+		for (unsigned key = 0; key < std::size(positions); ++key)
 		{
-			if (!BIT(m_keys, first + i))
+			if (!BIT(m_keys, key) || positions[key] < 0)
 				continue;
-			unsigned const row = first_row + i;
-			if (BIT(column_low, column))
-				rows &= ~(1U << row);
-			if (BIT(row_low, row))
+			unsigned const d = positions[key] % 5;
+			unsigned const e = positions[key] / 5;
+			if (BIT(row_low, d))
+				columns &= ~(1U << e);
+			if (BIT(column_low, e))
+				rows &= ~(1U << d);
+		}
+	}
+	else
+	{
+		for (unsigned column = 0; column < 6; ++column)
+		{
+			unsigned const first = column < 2 ? 5 + column * 2 : 9 + (column - 2) * 3;
+			unsigned const first_row = column < 2 ? 0 : 2;
+			unsigned const row_count = column < 2 ? 2 : 3;
+			for (unsigned i = 0; i < row_count; ++i)
+			{
+				if (!BIT(m_keys, first + i))
+					continue;
+				unsigned const row = first_row + i;
+				if (BIT(column_low, column))
+					rows &= ~(1U << row);
+				if (BIT(row_low, row))
+					columns &= ~(1U << column);
+			}
+			if (column >= 2 && BIT(m_keys, 19 + column) && BIT(m_key_row_drive, 5) && !m_key_gpio30)
 				columns &= ~(1U << column);
 		}
-		if (column >= 2 && BIT(m_keys, 19 + column) && BIT(m_key_row_drive, 5) && !m_key_gpio30)
-			columns &= ~(1U << column);
 	}
 	rows = (rows & ~m_key_row_drive) | (row_data & m_key_row_drive);
 	columns = (columns & ~m_key_column_drive) | (column_data & m_key_column_drive);
 
 	static constexpr unsigned rocker_pins[] = { 1, 10, 13, 2, 11 };
 	u16 inputs = 0x3c06;
-	for (unsigned i = 0; i < std::size(rocker_pins); ++i)
-		if (BIT(m_keys, i))
-			inputs &= ~(1U << rocker_pins[i]);
+	if (!m_is_qd)
+		for (unsigned i = 0; i < std::size(rocker_pins); ++i)
+			if (BIT(m_keys, i))
+				inputs &= ~(1U << rocker_pins[i]);
 	if (BIT(m_uem_regs[0x2a], 3) && !BIT(m_upp[0x50200 / 4], 16))
 		inputs &= ~2;
 
@@ -1121,6 +1185,8 @@ u32 ngage_state::upp_r(offs_t offset, u32 mem_mask)
 	u32 const addr = offset * 4;
 	if (addr >= 0x20600 && addr < 0x20640)
 		return m_mmc->read((addr - 0x20600) / 4, mem_mask);
+	if (m_qd_lcd && addr >= 0x21200 && addr <= 0x21208)
+		return m_qd_lcd->read((addr - 0x21200) / 4);
 	if (addr >= 0x20100 && addr < 0x20280)
 	{
 		unsigned const plane = (addr - 0x20100) / 0xc0;
@@ -1441,7 +1507,9 @@ void ngage_state::upp_w(offs_t offset, u32 data, u32 mem_mask)
 
 	if (addr >= 0x21200 && addr <= 0x21208 && mem_mask == 0xffffffff)
 	{
-		if (addr == 0x21204)
+		if (m_qd_lcd)
+			m_qd_lcd->write((addr - 0x21200) / 4, data);
+		else if (addr == 0x21204)
 		{
 			if (data == 2)
 			{
@@ -1580,7 +1648,9 @@ void ngage_state::lcd_data_w(u32 data)
 
 u32 ngage_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect)
 {
-	if (m_lcd_on)
+	if (m_qd_lcd)
+		m_qd_lcd->draw(bitmap, cliprect);
+	else if (m_lcd_on)
 	{
 		for (int y = cliprect.top(); y <= cliprect.bottom(); ++y)
 		{
@@ -1626,13 +1696,11 @@ void ngage_state::nos_trace_w(u32 data, u32 mem_mask)
 	}
 }
 
-void ngage_state::nem4_map(address_map &map)
+void ngage_state::common_map(address_map &map)
 {
-	map(0x00000000, 0x007fffff).rw(FUNC(ngage_state::flash_r<0>), FUNC(ngage_state::flash_w<0>));
 	map(0x02000000, 0x023fffff).r(FUNC(ngage_state::flash_r<1>));
 	map(0x02400000, 0x027fffff).r(FUNC(ngage_state::cdrive_r));
 	map(0x02000000, 0x027fffff).w(FUNC(ngage_state::flash_w<1>));
-	map(0x04000000, 0x047fffff).rw(FUNC(ngage_state::flash_r<2>), FUNC(ngage_state::flash_w<2>));
 	map(0x08000000, 0x08000fff).ram(); // External memory controller latches
 	map(0x0a000000, 0x0affffff).ram();
 	map(0x0c000000, 0x0c000fff).nopr(); // Undumped UPP ASIC ROM
@@ -1641,6 +1709,19 @@ void ngage_state::nem4_map(address_map &map)
 	map(0x0c100000, 0x0c1fffff).rw(FUNC(ngage_state::upp_r), FUNC(ngage_state::upp_w));
 	map(0x0d6d0000, 0x0d6d0003).w(FUNC(ngage_state::nos_trace_w));
 	map(0x0de00000, 0x0dffffff).w(FUNC(ngage_state::sti_w));
+}
+
+void ngage_state::nem4_map(address_map &map)
+{
+	common_map(map);
+	map(0x00000000, 0x007fffff).rw(FUNC(ngage_state::flash_r<0>), FUNC(ngage_state::flash_w<0>));
+	map(0x04000000, 0x047fffff).rw(FUNC(ngage_state::flash_r<2>), FUNC(ngage_state::flash_w<2>));
+}
+
+void ngage_state::qd_map(address_map &map)
+{
+	common_map(map);
+	map(0x00000000, 0x00ffffff).rw(FUNC(ngage_state::flash_r<0>), FUNC(ngage_state::flash_w<0>));
 }
 
 void ngage_state::nem4(machine_config &config)
@@ -1664,6 +1745,13 @@ void ngage_state::nem4(machine_config &config)
 	screen_device &screen(SCREEN(config, "screen").set_lcd());
 	screen.set_raw(6'500'000, 400, 0, LCD_WIDTH, 262, 0, LCD_HEIGHT); // Timing from the FPGA model
 	screen.set_screen_update(FUNC(ngage_state::screen_update));
+}
+
+void ngage_state::qd(machine_config &config)
+{
+	nem4(config);
+	NGAGE_QD_LCD(config, m_qd_lcd, 0);
+	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_state::qd_map);
 }
 
 INPUT_PORTS_START(ngage)
@@ -1716,6 +1804,14 @@ INPUT_PORTS_START(ngage)
 	PORT_BIT(0x04000000, IP_ACTIVE_HIGH, IPT_KEYPAD) PORT_NAME("Power") PORT_CODE(KEYCODE_F10) PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(ngage_state::key_changed), 26)
 INPUT_PORTS_END
 
+INPUT_PORTS_START(ngageqd)
+	PORT_INCLUDE(ngage)
+
+	PORT_MODIFY("KEYS")
+	PORT_BIT(0x00000100, IP_ACTIVE_HIGH, IPT_UNUSED) // Radio
+	PORT_BIT(0x02000000, IP_ACTIVE_HIGH, IPT_UNUSED) // Music
+INPUT_PORTS_END
+
 ROM_START(ngage)
 	ROM_REGION(0x1800000, "flash", 0)
 	ROM_LOAD("nem4_403_cs0.bin", 0x0000000, 0x800000, CRC(848f1c33) SHA1(1c420c64b15579706e9c3374f6dafc863825e9d7))
@@ -1723,6 +1819,28 @@ ROM_START(ngage)
 	ROM_LOAD("nem4_403_cs2.bin", 0x1000000, 0x800000, CRC(436711c7) SHA1(21141142b373098c0871a3daa10238c694766ef4))
 ROM_END
 
+ROM_START(ngageqd)
+	ROM_REGION(0x1800000, "flash", 0)
+	ROM_LOAD("rh29_410_cs0.bin", 0x0000000, 0x1000000, CRC(ec170b2c) SHA1(78879c4f6c83a6fbd9c5bc30d8de6ae50db8d898))
+	ROM_LOAD("rh29_410_cs1.bin", 0x1000000, 0x800000, CRC(a276df3a) SHA1(9fd6364bff02167db339e1d89ec0cade5de4e48e))
+ROM_END
+
+ROM_START(ngage417)
+	ROM_REGION(0x1800000, "flash", 0)
+	ROM_LOAD("nem4_417_cs0.bin", 0x0000000, 0x800000, CRC(dd63247f) SHA1(d9def4cf64f885737cee562ace349d7c22e4b387))
+	ROM_LOAD("nem4_417_cs1.bin", 0x0800000, 0x800000, CRC(38f7a1c1) SHA1(e3401877ac47380d3795718b69df1edd0b8f2e3b))
+	ROM_LOAD("nem4_417_cs2.bin", 0x1000000, 0x800000, CRC(f8f93ab7) SHA1(df266bebd73e63398fdf29e1d5651476fac3e582))
+ROM_END
+
+ROM_START(ngageqd415)
+	ROM_REGION(0x1800000, "flash", 0)
+	ROM_LOAD("rh29_415_cs0.bin", 0x0000000, 0x1000000, CRC(22e846cc) SHA1(b3081f5c82b574ddd1d3ce28bd300f132a920849))
+	ROM_LOAD("rh29_415_cs1.bin", 0x1000000, 0x800000, CRC(b59ec15b) SHA1(f21b6ed8fbff202f666365931cba657ac97168ce))
+ROM_END
+
 } // anonymous namespace
 
 SYST(2003, ngage, 0, 0, nem4, ngage, ngage_state, empty_init, "Nokia", "N-Gage (NEM-4, firmware 4.03)", MACHINE_NOT_WORKING)
+SYST(2004, ngageqd, 0, 0, qd, ngageqd, ngage_state, init_qd, "Nokia", "N-Gage QD (RH-29, firmware 4.10)", MACHINE_NOT_WORKING)
+SYST(2004, ngage417, ngage, 0, nem4, ngage, ngage_state, empty_init, "Nokia", "N-Gage (NEM-4, firmware 4.17)", MACHINE_NOT_WORKING)
+SYST(2004, ngageqd415, ngageqd, 0, qd, ngageqd, ngage_state, init_qd, "Nokia", "N-Gage QD (RH-29, firmware 4.15)", MACHINE_NOT_WORKING)
