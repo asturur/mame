@@ -15,13 +15,14 @@ u16 frame_word(std::span<u8 const> packet, unsigned offset)
 	return (u16(packet[offset]) << 8) | packet[offset + 1];
 }
 
-bool valid_halves(u32 first, u32 second, u32 bytes)
+bool valid_halves(u32 first, u32 second, u32 bytes, u32 memory_start, u32 memory_end)
 {
-	// The fifteen physical pages mapped by audio.ldd.
+	u64 const first_end = u64(first) + bytes;
+	u64 const second_end = u64(second) + bytes;
 	return bytes && !((first | second) & 1)
-		&& first >= 0x0a061000 && u64(first) + bytes <= 0x0a070000
-		&& second >= 0x0a061000 && u64(second) + bytes <= 0x0a070000
-		&& (first + bytes <= second || second + bytes <= first);
+		&& first >= memory_start && first_end <= memory_end
+		&& second >= memory_start && second_end <= memory_end
+		&& (first_end <= second || second_end <= first);
 }
 
 } // anonymous namespace
@@ -33,6 +34,13 @@ ngage_pcm_device::ngage_pcm_device(machine_config const &mconfig, char const *ta
 	, device_sound_interface(mconfig, *this)
 	, m_reply_ready(*this)
 {
+}
+
+void ngage_pcm_device::set_memory(address_space &memory, u32 start, u32 end)
+{
+	m_memory = &memory;
+	m_memory_start = start;
+	m_memory_end = end;
 }
 
 void ngage_pcm_device::device_start()
@@ -147,7 +155,8 @@ void ngage_pcm_device::receive(std::span<u8 const> packet)
 		u32 const first = (u32(frame_word(packet, 14)) << 16) | frame_word(packet, 16);
 		u32 const second = (u32(frame_word(packet, 18)) << 16) | frame_word(packet, 20);
 		if (packet[10] != 0x82 || packet[11] != 2 || packet[22]
-			|| (packet[23] != 0x32 && packet[23] != 0x46) || !valid_halves(first, second, u32(capacity) * 2))
+			|| (packet[23] != 0x32 && packet[23] != 0x46)
+			|| !valid_halves(first, second, u32(capacity) * 2, m_memory_start, m_memory_end))
 			return;
 
 		stop();

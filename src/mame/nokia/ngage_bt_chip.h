@@ -1,3 +1,5 @@
+// license:GPL-2.0+
+// copyright-holders:the NGage_MiSTer authors
 /*
  * The N-Gage QD's Bluetooth module as its driver sees it: CBUS device 5.
  *
@@ -34,8 +36,10 @@
  * Copyright (c) 2026 the NGage_MiSTer authors
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
-#ifndef HW_ARM_NGAGE_BT_CHIP_H
-#define HW_ARM_NGAGE_BT_CHIP_H
+#ifndef MAME_NOKIA_NGAGE_BT_CHIP_H
+#define MAME_NOKIA_NGAGE_BT_CHIP_H
+
+#pragma once
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -464,4 +468,4 @@ static inline void bt_hci_packet(BtChip *c, unsigned len)
     bt_chip_pump(c);
 }
 
-#endif
+#endif // MAME_NOKIA_NGAGE_BT_CHIP_H

@@ -48,6 +48,10 @@ constexpr u32 NOR_SIZE = 0x800000;
 constexpr u32 QD_CS0_SIZE = 0x1000000;
 constexpr u32 PMM_SIZE = 0x10000;
 constexpr u32 CDRIVE_SIZE = 0x400000;
+constexpr u32 SDRAM_BASE = 0x0a000000;
+constexpr u32 SDRAM_END = 0x0b000000;
+constexpr u32 UPP_ROM_BASE = 0x0c000000;
+constexpr u32 UPP_ROM_SIZE = 0x1000;
 constexpr u32 UPP_BASE = 0x0c100000;
 constexpr u32 UPP_WORDS = 0x100000 / 4;
 constexpr u32 ARM_SDRAM_CLOCK = 104'000'000;
@@ -62,6 +66,7 @@ constexpr u32 GENIO_ENABLE_MASK = ((KEYPAD_EVENTS | BLUETOOTH_EVENT) >> 16) * 0x
 constexpr u8 BLUETOOTH_CBUS_DEVICE = 5;
 constexpr u16 UEM_ADC_DEFAULT = 512;
 constexpr ioport_value BATTERY_LEVEL_MASK = 0x70;
+constexpr ioport_value REPAIR_CALENDAR_MIRROR = 0x80;
 // UEM channel 12 samples that produce seven through one bars in NEM-4 4.03.
 constexpr u16 BATTERY_VOLTAGE_ADC[] = { UEM_ADC_DEFAULT, 470, 465, 460, 450, 440, 430 };
 constexpr unsigned MDI_RING_WORDS = 250;
@@ -171,10 +176,18 @@ private:
 	void euart_update();
 	void dma_start(unsigned channel);
 	void lcd_dma_start(unsigned channel);
-	void mmc_dma_start(unsigned channel);
+	void mmc_dma_start(u32 channel);
+	void mmc_dma_resume(u32 channel);
 	void mmc_event(int state);
+	void mmc_media_changed(int state);
 	TIMER_CALLBACK_MEMBER(lcd_dma_complete);
 	struct keypad_levels { u8 rows, columns; u16 genio; };
+	struct mmc_dma_transfer
+	{
+		u32 address = 0;
+		u32 remaining = 0;
+		bool write = false;
+	};
 	keypad_levels keypad_read() const;
 	void keypad_update();
 	void lcd_header_w(u32 data);
@@ -275,6 +288,8 @@ private:
 	bool m_key_gpio30 = false;
 
 	emu_timer *m_lcd_dma_timer[8]{};
+	mmc_dma_transfer m_mmc_dma[8];
+	bool m_mmc_dma_running = false;
 	u16 m_lcd_pixels[LCD_WIDTH * LCD_HEIGHT]{};
 	u32 m_lcd_window_first = 0;
 	unsigned m_lcd_cursor = 0;
@@ -294,7 +309,7 @@ private:
 
 void ngage_state::machine_start()
 {
-	m_pcm->set_memory(m_maincpu->space(AS_PROGRAM));
+	m_pcm->set_memory(m_maincpu->space(AS_PROGRAM), SDRAM_BASE, SDRAM_END);
 	auto const word32 = [this](u32 offset)
 	{
 		return u32(m_flash[offset]) | (u32(m_flash[offset + 1]) << 8)
@@ -371,6 +386,9 @@ void ngage_state::machine_start()
 	save_item(NAME(m_key_last_columns));
 	save_item(NAME(m_key_last_genio));
 	save_item(NAME(m_key_gpio30));
+	save_item(STRUCT_MEMBER(m_mmc_dma, address));
+	save_item(STRUCT_MEMBER(m_mmc_dma, remaining));
+	save_item(STRUCT_MEMBER(m_mmc_dma, write));
 	save_item(NAME(m_lcd_pixels));
 	save_item(NAME(m_lcd_window_first));
 	save_item(NAME(m_lcd_cursor));
@@ -394,7 +412,7 @@ void ngage_state::machine_reset()
 	m_maincpu->set_unscaled_clock(ARM_SDRAM_CLOCK + (half_steps <= 4 ? half_steps : 0) * (ARM_SDRAM_CLOCK / 2));
 
 	finish_cdrive_erase();
-	if (!m_is_qd)
+	if (!m_is_qd && (m_config->read() & REPAIR_CALENDAR_MIRROR))
 		recover_calendar_mirror();
 	std::fill(std::begin(m_flash_mode), std::end(m_flash_mode), ARRAY);
 	std::fill(std::begin(m_flash_unlock), std::end(m_flash_unlock), 0);
@@ -441,6 +459,7 @@ void ngage_state::machine_reset()
 
 	for (auto *timer : m_lcd_dma_timer)
 		timer->enable(false);
+	std::fill(std::begin(m_mmc_dma), std::end(m_mmc_dma), mmc_dma_transfer{});
 	m_lcd_cursor = 0;
 	m_lcd_band_first = 0;
 	m_lcd_limit = m_lcd_band_end = LCD_PAIRS;
@@ -989,8 +1008,8 @@ void ngage_state::euart_update()
 	{
 		bool const powered = m_adsp_controls_written == 3 && !(m_uem_regs[0x2f] & 0xf0) && BIT(m_uem_regs[0x30], 5);
 		bool const receive_enabled = BIT(m_euart_enable, 3) && !(m_upp[0x50560 / 4] & 7);
-		m_adsp->power_w(powered && receive_enabled);
-		while (m_adsp->rx_pending() && ((m_euart_rx_producer + 1) & 15) != m_euart_rx_consumer)
+		m_adsp->power_w(powered);
+		while (receive_enabled && m_adsp->rx_pending() && ((m_euart_rx_producer + 1) & 15) != m_euart_rx_consumer)
 		{
 			m_euart_rx[m_euart_rx_producer] = m_adsp->rx_r();
 			m_euart_rx_producer = (m_euart_rx_producer + 1) & 15;
@@ -1012,15 +1031,39 @@ void ngage_state::mmc_event(int state)
 {
 	if (!state)
 		return;
-	for (unsigned channel = 0; channel < 8; ++channel)
-		if (((m_upp[0x20064 / 4] >> (channel * 4)) & 15) == 2)
-			mmc_dma_start(channel);
+	if (!m_mmc_dma_running)
+	{
+		for (u32 channel = 0; channel < std::size(m_mmc_dma); ++channel)
+		{
+			if (BIT(m_upp[0x20064 / 4], channel * 4, 4) != 2)
+				continue;
+			if (m_mmc_dma[channel].remaining)
+				mmc_dma_resume(channel);
+			else
+				mmc_dma_start(channel);
+		}
+	}
 	update_interrupts();
 }
 
-void ngage_state::mmc_dma_start(unsigned channel)
+void ngage_state::mmc_media_changed(int state)
 {
-	u32 *const reg = &m_upp[(0x20300 + channel * 0x40) / 4];
+	if (!state)
+		return;
+	for (u32 channel = 0; channel < std::size(m_mmc_dma); ++channel)
+	{
+		if (m_mmc_dma[channel].remaining)
+		{
+			m_mmc_dma[channel] = {};
+			m_upp[(0x20308 + channel * 0x40) / 4] = 0;
+		}
+	}
+	update_interrupts();
+}
+
+void ngage_state::mmc_dma_start(u32 channel)
+{
+	u32 const *const reg = &m_upp[(0x20300 + channel * 0x40) / 4];
 	if (reg[1] != 1 || (reg[2] != 2 && reg[2] != 3))
 		return;
 
@@ -1032,20 +1075,38 @@ void ngage_state::mmc_dma_start(unsigned channel)
 		&& reg[6] == 4 && reg[7] == 32;
 	u32 const address = receive ? reg[8] : reg[5];
 	u64 const bytes = u64(reg[11]) + 1;
-	if ((!receive && !transmit) || !m_mmc->dma_ready(transmit) || (address & 3) || (bytes & 3)
-			|| bytes > 4096 || address < 0x0a000000 || u64(address) + bytes > 0x0b000000)
+	if ((!receive && !transmit) || (address & 3) || (bytes & 3)
+			|| address < SDRAM_BASE || u64(address) + bytes > SDRAM_END)
 		return;
 
-	// Clear the run register before the FIFO's last word raises DataIdle.
-	// The callback can then see other armed channels without reentering this one.
-	reg[2] = 0;
+	m_mmc_dma[channel] = { address, u32(bytes), transmit };
+	mmc_dma_resume(channel);
+}
+
+void ngage_state::mmc_dma_resume(u32 channel)
+{
+	mmc_dma_transfer &transfer = m_mmc_dma[channel];
+	if (!transfer.remaining || !m_mmc->dma_ready(transfer.write))
+		return;
+
+	// The last FIFO access can signal DataIdle synchronously.
+	m_mmc_dma_running = true;
 	address_space &program = m_maincpu->space(AS_PROGRAM);
-	for (unsigned n = 0; n < bytes; n += 4)
-		if (receive)
-			program.write_dword(address + n, m_mmc->read(0x24 / 4, 0xffffffff));
+	while (transfer.remaining && m_mmc->dma_ready(transfer.write))
+	{
+		if (transfer.write)
+			m_mmc->write(0x24 / 4, program.read_dword(transfer.address), 0xffffffff);
 		else
-			m_mmc->write(0x24 / 4, program.read_dword(address + n), 0xffffffff);
-	m_irq_pending[0] |= 1U << (channel + 6);
+			program.write_dword(transfer.address, m_mmc->read(0x24 / 4, 0xffffffff));
+		transfer.address += 4;
+		transfer.remaining -= 4;
+	}
+	m_mmc_dma_running = false;
+	if (!transfer.remaining)
+	{
+		m_upp[(0x20308 + channel * 0x40) / 4] = 0;
+		m_irq_pending[0] |= 1U << (channel + 6);
+	}
 	update_interrupts();
 }
 
@@ -1059,7 +1120,7 @@ void ngage_state::lcd_dma_start(unsigned channel)
 	u32 const source = registers[5];
 	u32 const destination = registers[8];
 	u64 const words = u64(registers[11]) + 1;
-	bool const sdram = source >= 0x0a000000 && u64(source) + words * 4 <= 0x0b000000;
+	bool const sdram = source >= SDRAM_BASE && u64(source) + words * 4 <= SDRAM_END;
 	bool const panel_ready = m_qd_lcd ? m_qd_lcd->dma_ready(words)
 		: (m_lcd_pixel_header && m_lcd_write && m_lcd_cursor < m_lcd_limit && words <= m_lcd_limit - m_lcd_cursor);
 	if (registers[2] != 2 || registers[1] != 1 || request != 7 || !sdram || (source & 3)
@@ -1191,7 +1252,7 @@ u32 ngage_state::upp_r(offs_t offset, u32 mem_mask)
 	if (addr >= 0x20600 && addr < 0x20640)
 		return m_mmc->read((addr - 0x20600) / 4, mem_mask);
 	if (m_qd_lcd && addr >= 0x21200 && addr <= 0x21208)
-		return m_qd_lcd->read((addr - 0x21200) / 4);
+		return mem_mask == 0xffffffff ? m_qd_lcd->read((addr - 0x21200) / 4) : 0;
 	if (addr >= 0x20100 && addr < 0x20280)
 	{
 		unsigned const plane = (addr - 0x20100) / 0xc0;
@@ -1557,12 +1618,16 @@ void ngage_state::upp_w(offs_t offset, u32 data, u32 mem_mask)
 		if ((reg == 4 || reg == 8) && !m_upp[offset])
 		{
 			m_lcd_dma_timer[channel]->enable(false);
+			m_mmc_dma[channel] = {};
 			m_upp[(0x20308 + channel * 0x40) / 4] = 0;
 			m_irq_pending[0] &= ~(1U << (channel + 6));
 			update_interrupts();
 		}
 		else if (reg == 8)
+		{
+			m_mmc_dma[channel] = {};
 			dma_start(channel);
+		}
 	}
 	if (addr >= 0x20a00 && addr < 0x20ac0)
 	{
@@ -1708,9 +1773,12 @@ void ngage_state::common_map(address_map &map)
 	map(0x02400000, 0x027fffff).r(FUNC(ngage_state::cdrive_r));
 	map(0x02000000, 0x027fffff).w(FUNC(ngage_state::flash_w<1>));
 	map(0x08000000, 0x08000fff).ram(); // External memory controller latches
-	map(0x0a000000, 0x0affffff).ram();
-	map(0x0c000000, 0x0c000fff).nopr(); // Undumped UPP ASIC ROM
-	map(0x0c0003dc, 0x0c0003df).lr32(NAME([] () { return 0x47700000; })); // Thumb BX LR at 0x03de
+	map(SDRAM_BASE, SDRAM_END - 1).ram();
+	map(UPP_ROM_BASE, UPP_ROM_BASE + UPP_ROM_SIZE - 1).rom().region("upp_rom", 0);
+	// Bring-up hack for the undumped UPP ROM. Remove the overlay when the ROM is dumped.
+	static constexpr bool UPP_STARTUP_STUB = true;
+	if (UPP_STARTUP_STUB)
+		map(UPP_ROM_BASE + 0x3dc, UPP_ROM_BASE + 0x3df).lr32(NAME([] () -> u32 { return 0x47700000; })); // Thumb BX LR at 0x03de
 	map(0x0c001000, 0x0c0fffff).ram(); // On-chip RAM, including bootstrap scratch and DSP upload
 	map(0x0c100000, 0x0c1fffff).rw(FUNC(ngage_state::upp_r), FUNC(ngage_state::upp_w));
 	map(0x0d6d0000, 0x0d6d0003).w(FUNC(ngage_state::nos_trace_w));
@@ -1740,6 +1808,7 @@ void ngage_state::common(machine_config &config)
 	NGAGE_MMC(config, m_mmc, 8'666'667);
 	NGAGE_RTC(config, m_rtc, 0);
 	m_mmc->event_cb().set(FUNC(ngage_state::mmc_event));
+	m_mmc->media_change_cb().set(FUNC(ngage_state::mmc_media_changed));
 	NGAGE_SIM(config, m_sim, 0);
 
 	SPEAKER(config, "mono").front_center();
@@ -1785,6 +1854,9 @@ INPUT_PORTS_START(ngage)
 	PORT_CONFSETTING(0x40, "3 bars")
 	PORT_CONFSETTING(0x50, "2 bars")
 	PORT_CONFSETTING(0x60, "1 bar")
+	PORT_CONFNAME(REPAIR_CALENDAR_MIRROR, 0x00, "Repair RTC Calendar Mirror on Reset")
+	PORT_CONFSETTING(0x00, DEF_STR(No))
+	PORT_CONFSETTING(REPAIR_CALENDAR_MIRROR, DEF_STR(Yes))
 
 	PORT_START("KEYS")
 	PORT_BIT(0x00000001, IP_ACTIVE_HIGH, IPT_JOYSTICK_UP) PORT_8WAY PORT_CHANGED_MEMBER(DEVICE_SELF, FUNC(ngage_state::key_changed), 0)
@@ -1819,6 +1891,9 @@ INPUT_PORTS_END
 INPUT_PORTS_START(ngageqd)
 	PORT_INCLUDE(ngage)
 
+	PORT_MODIFY("CONFIG")
+	PORT_BIT(REPAIR_CALENDAR_MIRROR, IP_ACTIVE_HIGH, IPT_UNUSED)
+
 	PORT_MODIFY("KEYS")
 	PORT_BIT(0x00000100, IP_ACTIVE_HIGH, IPT_UNUSED) // Radio
 	PORT_BIT(0x02000000, IP_ACTIVE_HIGH, IPT_UNUSED) // Music
@@ -1828,6 +1903,9 @@ INPUT_PORTS_END
 // LFFS images were generated in fresh guests with only system data.
 // Existing saves load through the NVRAM device in preference to the region.
 ROM_START(ngage)
+	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
+	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
+
 	ROM_REGION(0x1800000, "flash", 0)
 	ROM_LOAD("nem4_403_cs0.bin", 0x0000000, 0x800000, CRC(848f1c33) SHA1(1c420c64b15579706e9c3374f6dafc863825e9d7))
 	ROM_LOAD("nem4_403_cs1.bin", 0x0800000, 0x800000, CRC(8e8ace41) SHA1(33448698969d26af0984ae6a6716cfd9841c7fa5))
@@ -1838,6 +1916,9 @@ ROM_START(ngage)
 ROM_END
 
 ROM_START(ngageqd)
+	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
+	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
+
 	ROM_REGION(0x1800000, "flash", 0)
 	ROM_LOAD("rh29_410_cs0.bin", 0x0000000, 0x1000000, CRC(ec170b2c) SHA1(78879c4f6c83a6fbd9c5bc30d8de6ae50db8d898))
 	ROM_LOAD("rh29_410_cs1.bin", 0x1000000, 0x800000, CRC(a276df3a) SHA1(9fd6364bff02167db339e1d89ec0cade5de4e48e))
@@ -1847,6 +1928,9 @@ ROM_START(ngageqd)
 ROM_END
 
 ROM_START(ngage417)
+	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
+	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
+
 	ROM_REGION(0x1800000, "flash", 0)
 	ROM_LOAD("nem4_417_cs0.bin", 0x0000000, 0x800000, CRC(dd63247f) SHA1(d9def4cf64f885737cee562ace349d7c22e4b387))
 	ROM_LOAD("nem4_417_cs1.bin", 0x0800000, 0x800000, CRC(38f7a1c1) SHA1(e3401877ac47380d3795718b69df1edd0b8f2e3b))
@@ -1857,6 +1941,9 @@ ROM_START(ngage417)
 ROM_END
 
 ROM_START(ngageqd415)
+	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
+	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
+
 	ROM_REGION(0x1800000, "flash", 0)
 	ROM_LOAD("rh29_415_cs0.bin", 0x0000000, 0x1000000, CRC(22e846cc) SHA1(b3081f5c82b574ddd1d3ce28bd300f132a920849))
 	ROM_LOAD("rh29_415_cs1.bin", 0x1000000, 0x800000, CRC(b59ec15b) SHA1(f21b6ed8fbff202f666365931cba657ac97168ce))

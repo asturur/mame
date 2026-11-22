@@ -13,7 +13,7 @@ public:
 	ngage_pcm_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
 
 	auto reply_ready() { return m_reply_ready.bind(); }
-	void set_memory(address_space &memory) { m_memory = &memory; }
+	void set_memory(address_space &memory, u32 start, u32 end) ATTR_COLD;
 	void disconnect();
 	void receive(std::span<u8 const> packet);
 	static constexpr unsigned REPLY_WORDS = 7;
@@ -37,6 +37,8 @@ private:
 
 	devcb_write_line m_reply_ready;
 	address_space *m_memory = nullptr;
+	u32 m_memory_start = 0;
+	u32 m_memory_end = 0;
 	sound_stream *m_stream = nullptr;
 	emu_timer *m_completion = nullptr;
 

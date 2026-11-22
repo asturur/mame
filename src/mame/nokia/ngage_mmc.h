@@ -12,6 +12,7 @@ public:
 
 	void set_hot_swap(bool enabled) { m_hot_swap = enabled; }
 	auto event_cb() { return m_event_cb.bind(); }
+	auto media_change_cb() { return m_media_change_cb.bind(); }
 	u32 read(offs_t offset, u32 mem_mask);
 	void write(offs_t offset, u32 data, u32 mem_mask);
 	u32 irq_sources() const;
@@ -21,6 +22,7 @@ public:
 protected:
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
+	virtual void device_post_load() override ATTR_COLD;
 	virtual std::pair<std::error_condition, std::string> call_load() override;
 	virtual void call_unload() override;
 	virtual bool is_readable() const noexcept override { return true; }
@@ -38,6 +40,7 @@ private:
 	static constexpr u32 DATA_TIMEOUT = 0x080, RESP_READY = 0x100, DATA_ERROR = 0x400;
 
 	void reset_card();
+	void abort_card_transfer();
 	void start(u32 control);
 	void card_command();
 	void response(u32 value);
@@ -50,12 +53,16 @@ private:
 	bool in_range(u64 offset, u32 length) const;
 	TIMER_CALLBACK_MEMBER(command_complete);
 	TIMER_CALLBACK_MEMBER(command_tail);
+	TIMER_CALLBACK_MEMBER(notify_media_change);
 
 	devcb_write_line m_event_cb;
+	devcb_write_line m_media_change_cb;
 	emu_timer *m_command_timer = nullptr;
 	emu_timer *m_tail_timer = nullptr;
 
 	bool m_hot_swap = false;
+	u64 m_mount_id = 0;
+	u64 m_saved_mount_id = 0;
 	u64 m_payload_size = 0;
 	u64 m_card_capacity = 0;
 	u8 m_cid[16]{};
