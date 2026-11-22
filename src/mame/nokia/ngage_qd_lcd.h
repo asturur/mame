@@ -20,8 +20,8 @@ protected:
 	virtual void device_reset() override ATTR_COLD;
 
 private:
-	static constexpr unsigned WIDTH = 176;
-	static constexpr unsigned HEIGHT = 208;
+	static constexpr u32 WIDTH = 176;
+	static constexpr u32 HEIGHT = 208;
 	void reset_panel();
 	void command_w(u8 data);
 	void data_w(u32 data);
@@ -31,38 +31,38 @@ private:
 	rgb_t rgb444(u8 r, u8 g, u8 b) const;
 	bool writing_pixels() const { return m_command == 0x2c || m_command == 0x3c; }
 
-	u32 m_gram[HEIGHT][WIDTH]{};
-	u32 m_control = 0;
-	u32 m_aux = 0;
-	u32 m_last_data = 0;
-	u32 m_phase_left = 0;
+	u32 m_gram[HEIGHT][WIDTH];
+	u32 m_control;
+	u32 m_aux;
+	u32 m_last_data;
+	u32 m_phase_left;
 
-	u8 m_command = 0;
-	u8 m_colmod = 6;
-	u8 m_madctl = 0;
-	bool m_sleep = true;
-	bool m_display_on = false;
-	bool m_partial = false;
-	bool m_idle = false;
-	bool m_tearing = false;
-	u16 m_partial_start = 0;
-	u16 m_partial_end = HEIGHT - 1;
-	u16 m_col_start = 0;
-	u16 m_col_end = WIDTH - 1;
-	u16 m_row_start = 0;
-	u16 m_row_end = HEIGHT - 1;
-	u16 m_col = 0;
-	u16 m_row = 0;
+	u8 m_command;
+	u8 m_colmod;
+	u8 m_madctl;
+	bool m_sleep;
+	bool m_display_on;
+	bool m_partial;
+	bool m_idle;
+	bool m_tearing;
+	u16 m_partial_start;
+	u16 m_partial_end;
+	u16 m_col_start;
+	u16 m_col_end;
+	u16 m_row_start;
+	u16 m_row_end;
+	u16 m_col;
+	u16 m_row;
 
-	u8 m_response[5]{};
-	u8 m_read_size = 0;
-	u8 m_read_pos = 0;
-	u8 m_parameters[48]{};
-	u8 m_parameter_count = 0;
-	u8 m_lut[48]{};
-	bool m_lut_valid = false;
-	u8 m_pixel[3]{};
-	u8 m_pixel_size = 0;
+	u8 m_response[5];
+	u8 m_read_size;
+	u8 m_read_pos;
+	u8 m_parameters[48];
+	u8 m_parameter_count;
+	u8 m_lut[48];
+	bool m_lut_valid;
+	u8 m_pixel[3];
+	u8 m_pixel_size;
 };
 
 DECLARE_DEVICE_TYPE(NGAGE_QD_LCD, ngage_qd_lcd_device)

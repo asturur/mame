@@ -7,6 +7,9 @@
 #include "ngage_sim.h"
 
 #include <algorithm>
+
+#define VERBOSE 0
+#include "logmacro.h"
 #include <array>
 
 namespace {
@@ -46,6 +49,9 @@ DEFINE_DEVICE_TYPE(NGAGE_SIM, ngage_sim_device, "ngage_sim", "N-Gage SIM interfa
 
 ngage_sim_device::ngage_sim_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
 	: device_t(mconfig, NGAGE_SIM, tag, owner, clock)
+	, m_present(false)
+	, m_reply{}
+	, m_header{}
 {
 }
 
@@ -185,7 +191,7 @@ void ngage_sim_device::command(u8 length)
 		m_reply[length + 1] = 0x90;
 		m_reply[length + 2] = 0;
 		m_length = length + 3;
-		logerror("SIM read EF %04x (%u bytes)\n", m_selected, length);
+		LOG("SIM read EF %04x (%u bytes)\n", m_selected, length);
 	}
 	else
 		reply_status(0x6d00);

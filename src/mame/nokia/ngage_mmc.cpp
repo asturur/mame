@@ -22,9 +22,9 @@ constexpr u32 BLOCK_LEN_ERROR = 1U << 29;
 constexpr u32 WRITE_PROTECTED = 1U << 26;
 constexpr u32 ILLEGAL_COMMAND = 1U << 22;
 
-void register_field(u8 *bytes, unsigned high, unsigned low, u32 value)
+void register_field(u8 *bytes, u32 high, u32 low, u32 value)
 {
-	for (unsigned bit = low; bit <= high; ++bit)
+	for (u32 bit = low; bit <= high; ++bit)
 		if (BIT(value, bit - low))
 			bytes[(127 - bit) / 8] |= 1U << (bit & 7);
 }
@@ -32,7 +32,7 @@ void register_field(u8 *bytes, unsigned high, unsigned low, u32 value)
 u8 register_crc(u8 const *bytes)
 {
 	u8 crc = 0;
-	for (unsigned i = 0; i < 15; ++i)
+	for (u32 i = 0; i < 15; ++i)
 		for (int bit = 7; bit >= 0; --bit)
 			crc = ((crc << 1) ^ ((BIT(crc, 6) != BIT(bytes[i], bit)) ? 9 : 0)) & 0x7f;
 	return (crc << 1) | 1;
@@ -47,7 +47,54 @@ ngage_mmc_device::ngage_mmc_device(machine_config const &mconfig, char const *ta
 	, device_image_interface(mconfig, *this)
 	, m_event_cb(*this)
 	, m_media_change_cb(*this)
+	, m_command_timer(nullptr)
+	, m_hot_swap(false)
+	, m_mount_id(0)
+	, m_saved_mount_id(0)
+	, m_payload_size(0)
+	, m_card_capacity(0)
+	, m_cid{}
+	, m_csd{}
+	, m_ocr(0)
+	, m_write_protected(false)
+	, m_response{}
+	, m_fifo{}
 {
+}
+
+bool ngage_mmc_device::is_readable() const noexcept
+{
+	return true;
+}
+
+bool ngage_mmc_device::is_writeable() const noexcept
+{
+	return true;
+}
+
+bool ngage_mmc_device::is_creatable() const noexcept
+{
+	return false;
+}
+
+bool ngage_mmc_device::is_reset_on_load() const noexcept
+{
+	return !m_hot_swap;
+}
+
+char const *ngage_mmc_device::image_type_name() const noexcept
+{
+	return "mmccard";
+}
+
+char const *ngage_mmc_device::image_brief_type_name() const noexcept
+{
+	return "mmc";
+}
+
+char const *ngage_mmc_device::file_extensions() const noexcept
+{
+	return "mmc,img,bin";
 }
 
 void ngage_mmc_device::device_start()
@@ -300,7 +347,7 @@ void ngage_mmc_device::response(u32 value)
 
 void ngage_mmc_device::response(u8 const *bytes)
 {
-	for (unsigned word = 0; word < 4; ++word)
+	for (u32 word = 0; word < 4; ++word)
 		m_response[word] = get_u32be(bytes + word * 4);
 	m_response_words = 4;
 	m_status |= RESP_READY;
@@ -434,7 +481,7 @@ void ngage_mmc_device::card_command()
 	case 17: case 18: case 24: case 25:
 	{
 		bool const write = m_command >= 24;
-		unsigned const card_class = write ? 4 : 2;
+		u32 const card_class = write ? 4 : 2;
 		u32 const classes = (m_csd[4] << 4) | (m_csd[5] >> 4);
 		if (m_card_state != TRANSFER || !BIT(classes, card_class))
 			break;
@@ -517,8 +564,8 @@ u32 ngage_mmc_device::fifo_r(u32 mask)
 		return 0;
 
 	u32 data = 0;
-	unsigned idx = m_fifo_pos;
-	for (unsigned lane = 0; lane < 32 && idx < m_fifo_length; lane += 8)
+	u32 idx = m_fifo_pos;
+	for (u32 lane = 0; lane < 32 && idx < m_fifo_length; lane += 8)
 		if (mask & (0xffU << lane))
 			data |= u32(m_fifo[idx++]) << lane;
 	if (!machine().side_effects_disabled())
@@ -535,7 +582,7 @@ void ngage_mmc_device::fifo_w(u32 data, u32 mask)
 	if (m_fifo_direction != FIFO_TX)
 		return;
 
-	for (unsigned lane = 0; lane < 32 && m_fifo_pos < m_fifo_length; lane += 8)
+	for (u32 lane = 0; lane < 32 && m_fifo_pos < m_fifo_length; lane += 8)
 		if (mask & (0xffU << lane))
 			m_fifo[m_fifo_pos++] = data >> lane;
 	if (m_fifo_pos == m_fifo_length)

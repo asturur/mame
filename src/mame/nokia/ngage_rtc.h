@@ -21,7 +21,7 @@ protected:
 
 private:
 	void set_counter(u32 value);
-	u32 m_base = 0;
+	u32 m_base;
 };
 
 DECLARE_DEVICE_TYPE(NGAGE_RTC, ngage_rtc_device)

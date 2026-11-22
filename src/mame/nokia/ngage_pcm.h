@@ -16,7 +16,7 @@ public:
 	void set_memory(address_space &memory, u32 start, u32 end) ATTR_COLD;
 	void disconnect();
 	void receive(std::span<u8 const> packet);
-	static constexpr unsigned REPLY_WORDS = 7;
+	static constexpr u32 REPLY_WORDS = 7;
 	std::span<u16 const> reply() const;
 	void reply_consumed();
 
@@ -36,32 +36,32 @@ private:
 	TIMER_CALLBACK_MEMBER(half_complete);
 
 	devcb_write_line m_reply_ready;
-	address_space *m_memory = nullptr;
-	u32 m_memory_start = 0;
-	u32 m_memory_end = 0;
-	sound_stream *m_stream = nullptr;
-	emu_timer *m_completion = nullptr;
+	address_space *m_memory;
+	u32 m_memory_start;
+	u32 m_memory_end;
+	sound_stream *m_stream;
+	emu_timer *m_completion;
 
-	u16 m_reply[REPLY_WORDS]{};
-	u8 m_media = 0;
-	u8 m_device = 0;
-	u8 m_object = 0;
-	u8 m_dsp_device = 0;
-	u8 m_dsp_object = 0;
-	bool m_reply_pending = false;
-	bool m_open = false;
-	bool m_first = true;
-	bool m_final_done = false;
-	u8 m_requested = NO_HALF;
-	u8 m_final = NO_HALF;
-	u8 m_playing = NO_HALF;
-	u8 m_free = 0;
-	u16 m_capacity = 0;
-	u16 m_final_frames = 0;
-	u32 m_address[2]{};
-	u16 m_frames[2]{};
-	u32 m_output_position = 0;
-	u8 m_repeat = 1;
+	u16 m_reply[REPLY_WORDS];
+	u8 m_media;
+	u8 m_device;
+	u8 m_object;
+	u8 m_dsp_device;
+	u8 m_dsp_object;
+	bool m_reply_pending;
+	bool m_open;
+	bool m_first;
+	bool m_final_done;
+	u8 m_requested;
+	u8 m_final;
+	u8 m_playing;
+	u8 m_free;
+	u16 m_capacity;
+	u16 m_final_frames;
+	u32 m_address[2];
+	u16 m_frames[2];
+	u32 m_output_position;
+	u8 m_repeat;
 };
 
 DECLARE_DEVICE_TYPE(NGAGE_PCM, ngage_pcm_device)

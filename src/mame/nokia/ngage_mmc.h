@@ -25,13 +25,13 @@ protected:
 	virtual void device_post_load() override ATTR_COLD;
 	virtual std::pair<std::error_condition, std::string> call_load() override;
 	virtual void call_unload() override;
-	virtual bool is_readable() const noexcept override { return true; }
-	virtual bool is_writeable() const noexcept override { return true; }
-	virtual bool is_creatable() const noexcept override { return false; }
-	virtual bool is_reset_on_load() const noexcept override { return !m_hot_swap; }
-	virtual char const *image_type_name() const noexcept override { return "mmccard"; }
-	virtual char const *image_brief_type_name() const noexcept override { return "mmc"; }
-	virtual char const *file_extensions() const noexcept override { return "mmc,img,bin"; }
+	virtual bool is_readable() const noexcept override;
+	virtual bool is_writeable() const noexcept override;
+	virtual bool is_creatable() const noexcept override;
+	virtual bool is_reset_on_load() const noexcept override;
+	virtual char const *image_type_name() const noexcept override;
+	virtual char const *image_brief_type_name() const noexcept override;
+	virtual char const *file_extensions() const noexcept override;
 
 private:
 	enum : u8 { IDLE, READY, IDENT, STANDBY, TRANSFER, DATA, RECEIVE, INACTIVE };
@@ -57,37 +57,37 @@ private:
 
 	devcb_write_line m_event_cb;
 	devcb_write_line m_media_change_cb;
-	emu_timer *m_command_timer = nullptr;
-	emu_timer *m_tail_timer = nullptr;
+	emu_timer *m_command_timer;
+	emu_timer *m_tail_timer;
 
-	bool m_hot_swap = false;
-	u64 m_mount_id = 0;
-	u64 m_saved_mount_id = 0;
-	u64 m_payload_size = 0;
-	u64 m_card_capacity = 0;
-	u8 m_cid[16]{};
-	u8 m_csd[16]{};
-	u32 m_ocr = 0;
-	bool m_write_protected = false;
+	bool m_hot_swap;
+	u64 m_mount_id;
+	u64 m_saved_mount_id;
+	u64 m_payload_size;
+	u64 m_card_capacity;
+	u8 m_cid[16];
+	u8 m_csd[16];
+	u32 m_ocr;
+	bool m_write_protected;
 
-	u32 m_reg[16]{};
-	u32 m_status = 0;
-	u8 m_type = 0;
-	u8 m_command = 0;
-	u32 m_argument = 0;
-	u32 m_response[4]{};
-	u8 m_response_words = 0;
-	u8 m_response_pos = 0;
-	u8 m_card_state = IDLE;
-	u16 m_rca = 1;
-	u16 m_block_length = 512;
-	bool m_multiblock = false;
-	u64 m_next_address = 0;
+	u32 m_reg[16];
+	u32 m_status;
+	u8 m_type;
+	u8 m_command;
+	u32 m_argument;
+	u32 m_response[4];
+	u8 m_response_words;
+	u8 m_response_pos;
+	u8 m_card_state;
+	u16 m_rca;
+	u16 m_block_length;
+	bool m_multiblock;
+	u64 m_next_address;
 
-	u8 m_fifo_direction = FIFO_IDLE;
-	u8 m_fifo[4096]{};
-	u16 m_fifo_length = 0;
-	u16 m_fifo_pos = 0;
+	u8 m_fifo_direction;
+	u8 m_fifo[4096];
+	u16 m_fifo_length;
+	u16 m_fifo_pos;
 };
 
 DECLARE_DEVICE_TYPE(NGAGE_MMC, ngage_mmc_device)

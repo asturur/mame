@@ -23,6 +23,9 @@
 #include <algorithm>
 #include <array>
 
+#define VERBOSE 0
+#include "logmacro.h"
+
 namespace {
 
 constexpr u32 BOOT_RAM_BYTES = 0x40000;
@@ -32,7 +35,7 @@ constexpr u32 D551_MARKER_ADDRESS = D551_BASE + 0x160000;
 constexpr u16 D551_MARKER = 0xfffc;
 constexpr u32 BOOT_TABLE_START = 0x1000;
 constexpr u32 BOOT_TABLE_END = 0x17698;
-constexpr unsigned BOOT_RECORD_COUNT = 17;
+constexpr u32 BOOT_RECORD_COUNT = 17;
 constexpr u32 BOOT_RECORD_HEADER = 8;
 
 ROM_START(ngage_adsp)
@@ -50,6 +53,10 @@ ngage_adsp_device::ngage_adsp_device(machine_config const &mconfig, char const *
 	, m_program_config("program", ENDIANNESS_BIG, 8, 24, 0, address_map_constructor(FUNC(ngage_adsp_device::program_map), this))
 	, m_d551(*this, "d551")
 	, m_boot_ram(*this, "bootram")
+	, m_frame{}
+	, m_output{}
+	, m_request{}
+	, m_reply{}
 {
 }
 
@@ -81,7 +88,7 @@ bool ngage_adsp_device::load_boot_ram()
 
 	std::array<record, BOOT_RECORD_COUNT> records;
 	u32 cursor = BOOT_TABLE_START;
-	for (unsigned index = 0; index < records.size(); ++index)
+	for (u32 index = 0; index < records.size(); ++index)
 	{
 		if (BOOT_TABLE_END - cursor < BOOT_RECORD_HEADER)
 			return false;
@@ -96,7 +103,7 @@ bool ngage_adsp_device::load_boot_ram()
 
 		auto &record = records[index];
 		record = { cursor, word_address * 2, words * 2 };
-		for (unsigned preceding = 0; preceding < index; ++preceding)
+		for (u32 preceding = 0; preceding < index; ++preceding)
 		{
 			auto const &previous = records[preceding];
 			if (record.address < previous.address + previous.size && previous.address < record.address + record.size)
@@ -215,7 +222,7 @@ void ngage_adsp_device::send_startup(bool reset_only)
 	if (!reset_only)
 		send_frame(0xd0, startup);
 	send_frame(0xd0, link_reset);
-	logerror("Audio DSP sent D0 startup frames\n");
+	LOG("Audio DSP sent D0 startup frames\n");
 }
 
 void ngage_adsp_device::tx_w(u8 data)
@@ -232,7 +239,7 @@ void ngage_adsp_device::tx_w(u8 data)
 	if (m_frame_size < 8)
 		return;
 
-	unsigned const length = m_frame[7];
+	u32 const length = m_frame[7];
 	if (length < 2 || length > MAX_PAYLOAD)
 	{
 		m_frame_size = 0;
@@ -248,13 +255,13 @@ void ngage_adsp_device::tx_w(u8 data)
 void ngage_adsp_device::handle_frame()
 {
 	u16 checksum = 0;
-	for (unsigned i = 2; i < m_frame_size; i += 2)
+	for (u32 i = 2; i < m_frame_size; i += 2)
 		checksum ^= (u16(m_frame[i]) << 8) | m_frame[i + 1];
 	if (checksum || m_frame[2] != 0x20 || m_frame[3] != 0x78 || m_frame[4] || m_frame[6])
 		return;
 
 	u8 const resource = m_frame[5];
-	unsigned const length = m_frame[7];
+	u32 const length = m_frame[7];
 	u8 const *const data = &m_frame[8];
 	u8 const flags = data[length - 1];
 	u8 const sequence = flags & 7;
@@ -270,7 +277,7 @@ void ngage_adsp_device::handle_frame()
 		if (m_state == WAIT_LINK)
 		{
 			m_state = READY;
-			logerror("Audio DSP accepted D0/05 link confirmation\n");
+			LOG("Audio DSP accepted D0/05 link confirmation\n");
 		}
 		return;
 	}
@@ -307,7 +314,7 @@ void ngage_adsp_device::handle_frame()
 	bool const diagnostic = length == 12 && operation == 0x2b && data[4] == 0 && data[5] == 7;
 	bool const gain = length == 12 && operation == 0x17 && data[4] == 0 && data[5] == 3;
 	bool const control = length == 10 && operation == 0x4b && data[4] == 0 && data[5] == 3;
-	unsigned const reply_size = diagnostic ? 12 : (gain || control) ? 10 : 0;
+	u32 const reply_size = diagnostic ? 12 : (gain || control) ? 10 : 0;
 	if (m_output_count + 12 + (reply_size ? 10 + reply_size : 0) > std::size(m_output))
 		return;
 
@@ -343,5 +350,5 @@ void ngage_adsp_device::handle_frame()
 	m_reply[reply_size - 1] = 0x60 | m_device_sequence;
 	send_frame(0x82, std::span(m_reply).first(reply_size));
 	m_state = WAIT_ACK;
-	logerror("Audio DSP application %02x returned %02x status %04x\n", operation, m_reply[3], result);
+	LOG("Audio DSP application %02x returned %02x status %04x\n", operation, m_reply[3], result);
 }

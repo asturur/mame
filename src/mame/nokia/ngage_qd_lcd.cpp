@@ -15,6 +15,11 @@ DEFINE_DEVICE_TYPE(NGAGE_QD_LCD, ngage_qd_lcd_device, "ngage_qd_lcd", "N-Gage QD
 
 ngage_qd_lcd_device::ngage_qd_lcd_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
 	: device_t(mconfig, NGAGE_QD_LCD, tag, owner, clock)
+	, m_gram{}
+	, m_response{}
+	, m_parameters{}
+	, m_lut{}
+	, m_pixel{}
 {
 }
 
@@ -126,8 +131,8 @@ void ngage_qd_lcd_device::write(offs_t offset, u32 data)
 
 bool ngage_qd_lcd_device::dma_ready(u64 words) const
 {
-	unsigned const packing = (m_control >> 18) & 3;
-	unsigned const bytes_per_word = packing == 1 ? 3 : 4;
+	u32 const packing = (m_control >> 18) & 3;
+	u32 const bytes_per_word = packing == 1 ? 3 : 4;
 	return writing_pixels() && (packing == 1 || packing == 3)
 		&& m_phase_left && words <= (m_phase_left + bytes_per_word - 1) / bytes_per_word;
 }
@@ -135,7 +140,7 @@ bool ngage_qd_lcd_device::dma_ready(u64 words) const
 void ngage_qd_lcd_device::data_w(u32 data)
 {
 	m_last_data = data;
-	unsigned const packing = (m_control >> 18) & 3;
+	u32 const packing = (m_control >> 18) & 3;
 	if (packing == 2)
 	{
 		command_w(u8(data));
@@ -144,7 +149,7 @@ void ngage_qd_lcd_device::data_w(u32 data)
 	if (packing == 0)
 		return;
 
-	unsigned const bytes = packing == 1 ? 3 : 4;
+	u32 const bytes = packing == 1 ? 3 : 4;
 	if (packing == 1)
 	{
 		u32 const lo = data & 0x0fff;
@@ -155,7 +160,7 @@ void ngage_qd_lcd_device::data_w(u32 data)
 			? (lo >> 4) | ((lo & 15) << 12) | ((hi >> 8) << 8) | ((hi & 0xff) << 16)
 			: lo | (hi << 12);
 	}
-	for (unsigned i = 0; i < bytes && m_phase_left; ++i, --m_phase_left)
+	for (u32 i = 0; i < bytes && m_phase_left; ++i, --m_phase_left)
 	{
 		if (writing_pixels())
 			pixel_byte_w(u8(data));
@@ -284,8 +289,8 @@ void ngage_qd_lcd_device::pixel_byte_w(u8 data)
 
 void ngage_qd_lcd_device::pixel_w(rgb_t color)
 {
-	unsigned x = m_col;
-	unsigned y = m_row;
+	u32 x = m_col;
+	u32 y = m_row;
 	if (BIT(m_madctl, 5))
 		std::swap(x, y);
 	if (BIT(m_madctl, 6))
@@ -315,8 +320,8 @@ void ngage_qd_lcd_device::draw(bitmap_rgb32 &bitmap, rectangle const &cliprect) 
 	// The panel is mounted rotated 180 degrees in the QD reference.
 	for (int y = cliprect.top(); y <= cliprect.bottom(); ++y)
 	{
-		unsigned const gram_row = HEIGHT - 1 - y;
-		unsigned const addressed_row = BIT(m_madctl, 7) ? y : gram_row;
+		u32 const gram_row = HEIGHT - 1 - y;
+		u32 const addressed_row = BIT(m_madctl, 7) ? y : gram_row;
 		for (int x = cliprect.left(); x <= cliprect.right(); ++x)
 		{
 			u32 pixel = rgb_t::black();

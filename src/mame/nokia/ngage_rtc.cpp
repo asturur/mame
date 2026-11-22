@@ -5,14 +5,23 @@
 #include "emu.h"
 #include "ngage_rtc.h"
 
+#include "emuopts.h"
+
 #include "multibyte.h"
 
+#include <cstring>
 #include <ctime>
+#include <string_view>
 
 namespace {
 
 constexpr u32 DAY_SECONDS = 86400;
 constexpr u32 COUNTER_PERIOD = 256 * DAY_SECONDS;
+
+u32 time_of_day(system_time const &time)
+{
+	return time.local_time.hour * 3600 + time.local_time.minute * 60 + time.local_time.second;
+}
 
 } // anonymous namespace
 
@@ -48,7 +57,7 @@ void ngage_rtc_device::nvram_default()
 {
 	system_time time;
 	machine().base_datetime(time);
-	set_counter(time.local_time.hour * 3600 + time.local_time.minute * 60 + time.local_time.second);
+	set_counter(time_of_day(time));
 }
 
 bool ngage_rtc_device::nvram_read(util::read_stream &file)
@@ -61,10 +70,22 @@ bool ngage_rtc_device::nvram_read(util::read_stream &file)
 		return false;
 	}
 
+	system_time base;
+	machine().base_datetime(base);
+	u32 const saved_counter = get_u32le(&data[4]);
+	std::string_view const rtc_override = machine().options().rtc_time();
+	if (!*machine().options().playback() && rtc_override.size() == 14
+			&& rtc_override.find_first_not_of("0123456789") == std::string_view::npos)
+	{
+		// NOS keeps the absolute date in PMM. Override the UEM time of day.
+		set_counter(saved_counter - (saved_counter % DAY_SECONDS) + time_of_day(base));
+		return true;
+	}
+
 	u64 const saved = get_u64le(&data[8]);
-	s64 const now = std::time(nullptr);
+	s64 const now = base.time;
 	u64 const elapsed = now > 0 && saved && u64(now) > saved ? u64(now) - saved : 0;
-	set_counter((get_u32le(&data[4]) + elapsed % COUNTER_PERIOD) % COUNTER_PERIOD);
+	set_counter((saved_counter + elapsed % COUNTER_PERIOD) % COUNTER_PERIOD);
 	return true;
 }
 

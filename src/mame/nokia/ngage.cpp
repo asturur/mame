@@ -2,11 +2,7 @@
 // copyright-holders:Andrea Bogazzi
 /***************************************************************************
 
-    Nokia N-Gage (NEM-4)
-
-    The 4.03 ROM set is assembled from Nokia service files nem440.3c1 and
-    nem440.326, with the PPM ranges overlaid. The images are in chip-select
-    order and preserve the scrambled NOS bytes and erased writable areas.
+    Nokia N-Gage (NEM-4) and N-Gage QD (RH-29)
 
     UPP_WD2 behavior and NOR commands are based on the NEM-4 FPGA study.
     The ASIC ROM is undumped. Only the observed startup call at 0x03de
@@ -40,7 +36,14 @@
 #include <algorithm>
 #include <bit>
 #include <bitset>
+#include <cstring>
 #include <span>
+
+#define LOG_REGISTERS (1U << 1)
+#define LOG_MDI       (1U << 2)
+#define LOG_FIRMWARE  (1U << 3)
+#define VERBOSE 0
+#include "logmacro.h"
 
 namespace {
 
@@ -69,14 +72,14 @@ constexpr ioport_value BATTERY_LEVEL_MASK = 0x70;
 constexpr ioport_value REPAIR_CALENDAR_MIRROR = 0x80;
 // UEM channel 12 samples that produce seven through one bars in NEM-4 4.03.
 constexpr u16 BATTERY_VOLTAGE_ADC[] = { UEM_ADC_DEFAULT, 470, 465, 460, 450, 440, 430 };
-constexpr unsigned MDI_RING_WORDS = 250;
+constexpr u32 MDI_RING_WORDS = 250;
 constexpr u32 MDI_TX_POINTERS = 0x3e8 / 4;
 constexpr u32 MDI_RX_POINTERS = 0x3ec / 4;
 constexpr u32 MDI_CONTROL = 0x4b004 / 4;
-constexpr unsigned LCD_WIDTH = 176;
-constexpr unsigned LCD_HEIGHT = 208;
-constexpr unsigned LCD_ROW_PAIRS = LCD_WIDTH / 2;
-constexpr unsigned LCD_PAIRS = LCD_ROW_PAIRS * LCD_HEIGHT;
+constexpr u32 LCD_WIDTH = 176;
+constexpr u32 LCD_HEIGHT = 208;
+constexpr u32 LCD_ROW_PAIRS = LCD_WIDTH / 2;
+constexpr u32 LCD_PAIRS = LCD_ROW_PAIRS * LCD_HEIGHT;
 
 // UPP flash read-side equations from Andrea Bogazzi's ngage_descramble.v.
 u16 descramble_nos(u16 cipher, u32 address)
@@ -108,10 +111,10 @@ u16 descramble_nos(u16 cipher, u32 address)
 	};
 
 	u16 plain = 0;
-	for (unsigned i = 0; i < std::size(equations); ++i)
+	for (u32 i = 0; i < std::size(equations); ++i)
 	{
 		auto const &eq = equations[i];
-		unsigned const parity = std::popcount(unsigned(cipher & eq.cipher_mask))
+		u32 const parity = std::popcount(u32(cipher & eq.cipher_mask))
 			^ std::popcount(address & eq.address_mask)
 			^ (BIT(address, eq.a) & BIT(address, eq.b))
 			^ (BIT(address, eq.c) & BIT(address, eq.d))
@@ -124,42 +127,64 @@ u16 descramble_nos(u16 cipher, u32 address)
 class ngage_state : public driver_device
 {
 public:
-	ngage_state(machine_config const &mconfig, device_type type, char const *tag)
+	DECLARE_INPUT_CHANGED_MEMBER(key_changed);
+
+protected:
+	struct keypad_levels { u8 rows, columns; u16 genio; };
+
+	ngage_state(machine_config const &mconfig, device_type type, char const *tag,
+			u32 cs0_size, u16 rtc_calibration, u16 uem_product_bits)
 		: driver_device(mconfig, type, tag)
 		, m_maincpu(*this, "maincpu")
 		, m_flash(*this, "flash")
 		, m_pmm_nvram(*this, "pmm")
 		, m_cdrive_nvram(*this, "cdrive")
-		, m_adsp(*this, "adsp")
 		, m_bt(*this, "bluetooth")
 		, m_mmc(*this, "mmc")
 		, m_rtc(*this, "rtc")
 		, m_pcm(*this, "pcm")
-		, m_qd_lcd(*this, "qd_lcd")
 		, m_sim(*this, "sim")
 		, m_config(*this, "CONFIG")
+		, m_cs0_size(cs0_size)
+		, m_rtc_calibration(rtc_calibration)
+		, m_uem_product_bits(uem_product_bits)
 	{
 	}
 
-	void nem4(machine_config &config) ATTR_COLD;
-	void qd(machine_config &config) ATTR_COLD;
-	void init_qd() { m_is_qd = true; }
-	DECLARE_INPUT_CHANGED_MEMBER(key_changed);
-
-protected:
 	virtual void machine_start() override ATTR_COLD;
 	virtual void machine_reset() override ATTR_COLD;
 
+	void common(machine_config &config, bool mmc_hot_swap) ATTR_COLD;
+	template <bool Samsung> void common_map(address_map &map) ATTR_COLD;
+	template <u32 Chip, bool Samsung> u16 flash_r(offs_t offset);
+	template <u32 Chip, bool Samsung> void flash_w(offs_t offset, u16 data, u16 mem_mask);
+	void recover_calendar_mirror() ATTR_COLD;
+	void euart_update();
+
+	virtual keypad_levels keypad_matrix(u8 row_low, u8 column_low) const = 0;
+	virtual u32 lcd_r(offs_t offset, u32 mem_mask) = 0;
+	virtual void lcd_w(offs_t offset, u32 data) = 0;
+	virtual void lcd_data_w(u32 data) = 0;
+	virtual bool lcd_dma_ready(u64 words) const = 0;
+	virtual u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect) = 0;
+	virtual void audio_dsp_uem_w(u8 reg) { }
+	virtual void audio_dsp_tx_w(u8 data) { }
+	virtual void audio_dsp_receive() { }
+
+	required_device<arm920t_cpu_device> m_maincpu;
+	u32 m_upp[UPP_WORDS]{};
+	u16 m_uem_regs[256]{};
+	u16 m_euart_enable = 0;
+	u8 m_euart_rx[16]{};
+	u8 m_euart_rx_producer = 0;
+	u8 m_euart_rx_consumer = 0;
+	u32 m_keys = 0;
+	u8 m_key_row_drive = 0x3f;
+	bool m_key_gpio30 = false;
+
 private:
-	void nem4_map(address_map &map) ATTR_COLD;
-	void qd_map(address_map &map) ATTR_COLD;
-	void common(machine_config &config) ATTR_COLD;
-	void common_map(address_map &map) ATTR_COLD;
-	u32 cs0_size() const { return m_is_qd ? QD_CS0_SIZE : NOR_SIZE; }
-	template <unsigned Chip> u16 flash_r(offs_t offset);
-	template <unsigned Chip> void flash_w(offs_t offset, u16 data, u16 mem_mask);
-	template <unsigned Chip> u8 *flash_storage(u32 addr);
-	u32 cdrive_r(offs_t offset, u32 mem_mask);
+	template <u32 Chip> u8 *flash_storage(u32 addr);
+	template <bool Samsung> u32 cdrive_r(offs_t offset, u32 mem_mask);
 	void finish_cdrive_erase();
 	u32 upp_r(offs_t offset, u32 mem_mask);
 	void upp_w(offs_t offset, u32 data, u32 mem_mask);
@@ -167,21 +192,18 @@ private:
 	void uem_w(u8 reg, u16 data);
 	void bt_event(int state);
 	bool bt_irq_active() const;
-	void recover_calendar_mirror();
 	void mdi_update();
 	void pcm_reply_ready(int state);
-	u16 mdi_word(unsigned index) const;
+	u16 mdi_word(u32 index) const;
 	void mdi_publish(std::span<u16 const> words);
 	u16 euart_status() const;
-	void euart_update();
-	void dma_start(unsigned channel);
-	void lcd_dma_start(unsigned channel);
+	void dma_start(u32 channel);
+	void lcd_dma_start(u32 channel);
 	void mmc_dma_start(u32 channel);
 	void mmc_dma_resume(u32 channel);
 	void mmc_event(int state);
 	void mmc_media_changed(int state);
 	TIMER_CALLBACK_MEMBER(lcd_dma_complete);
-	struct keypad_levels { u8 rows, columns; u16 genio; };
 	struct mmc_dma_transfer
 	{
 		u32 address = 0;
@@ -190,17 +212,14 @@ private:
 	};
 	keypad_levels keypad_read() const;
 	void keypad_update();
-	void lcd_header_w(u32 data);
-	void lcd_data_w(u32 data);
-	u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect);
 	void sti_w(offs_t offset, u8 data);
 	void nos_trace_w(u32 data, u32 mem_mask);
-	u32 interrupt_sources(unsigned bank, bool fiq) const;
+	u32 interrupt_sources(u32 bank, bool fiq) const;
 	void update_interrupts();
 	u16 ctsi_count() const;
 	u16 ctsi_window() const;
-	u32 timer_count(unsigned n) const;
-	void set_timer_count(unsigned n, u32 count);
+	u32 timer_count(u32 n) const;
+	void set_timer_count(u32 n, u32 count);
 	TIMER_CALLBACK_MEMBER(timer_expired);
 	TIMER_CALLBACK_MEMBER(ctsi_compare_expired);
 	TIMER_CALLBACK_MEMBER(mdi_announce);
@@ -209,20 +228,19 @@ private:
 	enum : u8 { ARRAY, IDENTIFY, STATUS, PROTECTION, CFI };
 	enum : u8 { IDLE, AMD_PROGRAM, AMD_ERASE, INTEL_PROGRAM, INTEL_ERASE };
 
-	required_device<arm920t_cpu_device> m_maincpu;
 	required_region_ptr<u8> m_flash;
 	required_device<nvram_device> m_pmm_nvram;
 	required_device<nvram_device> m_cdrive_nvram;
-	optional_device<ngage_adsp_device> m_adsp;
 	required_device<ngage_bt_device> m_bt;
 	required_device<ngage_mmc_device> m_mmc;
 	required_device<ngage_rtc_device> m_rtc;
 	required_device<ngage_pcm_device> m_pcm;
-	optional_device<ngage_qd_lcd_device> m_qd_lcd;
 	required_device<ngage_sim_device> m_sim;
 	required_ioport m_config;
 
-	bool m_is_qd = false;
+	const u32 m_cs0_size;
+	const u16 m_rtc_calibration;
+	const u16 m_uem_product_bits;
 	std::vector<u16> m_decoded_nos;
 	u32 m_nos_start = 0;
 	u32 m_nos_end = 0;
@@ -238,7 +256,6 @@ private:
 	u32 m_cdrive_erase_size = 0;
 	bool m_cdrive_erase_polled = false;
 
-	u32 m_upp[UPP_WORDS]{};
 	std::bitset<UPP_WORDS> m_upp_reads;
 	std::bitset<UPP_WORDS> m_upp_writes;
 	u32 m_irq_enable[3]{};
@@ -251,7 +268,6 @@ private:
 	u64 m_ctsi_fast_start = 0;
 	u64 m_ctsi_nos_start = 0;
 
-	u16 m_uem_regs[256]{};
 	u16 m_uem_adc_result = UEM_ADC_DEFAULT;
 	emu_timer *m_uem_timer = nullptr;
 	bool m_uem_irq = false;
@@ -267,35 +283,61 @@ private:
 	bool m_mdi_announce_due = false;
 	bool m_mdi_announced = false;
 
-	u8 m_adsp_controls_written = 0;
-	u16 m_euart_enable = 0;
 	u8 m_euart_batch_left = 0;
 	u8 m_euart_tx_index = 0;
 	bool m_euart_tx_done = false;
-	u8 m_euart_rx[16]{};
-	u8 m_euart_rx_producer = 0;
-	u8 m_euart_rx_consumer = 0;
 
-	u32 m_keys = 0;
 	u32 m_key_pending = 0;
-	u8 m_key_row_drive = 0x3f;
 	u8 m_key_column_drive = 0;
 	u8 m_key_row_enable = 0;
 	u8 m_key_column_enable = 0;
 	u8 m_ctsi_genio_enable = 0;
 	u8 m_key_last_columns = 0x3f;
 	u16 m_key_last_genio = 0x3c06;
-	bool m_key_gpio30 = false;
 
 	emu_timer *m_lcd_dma_timer[8]{};
 	mmc_dma_transfer m_mmc_dma[8];
 	bool m_mmc_dma_running = false;
+	std::string m_sti_line;
+	std::string m_nos_trace_line;
+};
+
+class ngage_nem4_state : public ngage_state
+{
+public:
+	ngage_nem4_state(machine_config const &mconfig, device_type type, char const *tag)
+		: ngage_state(mconfig, type, tag, NOR_SIZE, 1, 0)
+		, m_adsp(*this, "adsp")
+	{
+	}
+
+	void nem4(machine_config &config) ATTR_COLD;
+
+protected:
+	virtual void machine_start() override ATTR_COLD;
+	virtual void machine_reset() override ATTR_COLD;
+
+private:
+	void nem4_map(address_map &map) ATTR_COLD;
+	virtual keypad_levels keypad_matrix(u8 row_low, u8 column_low) const override;
+	virtual u32 lcd_r(offs_t offset, u32 mem_mask) override;
+	virtual void lcd_w(offs_t offset, u32 data) override;
+	virtual void lcd_data_w(u32 data) override;
+	virtual bool lcd_dma_ready(u64 words) const override;
+	virtual u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect) override;
+	virtual void audio_dsp_uem_w(u8 reg) override;
+	virtual void audio_dsp_tx_w(u8 data) override;
+	virtual void audio_dsp_receive() override;
+	void lcd_header_w(u32 data);
+
+	required_device<ngage_adsp_device> m_adsp;
+	u8 m_adsp_controls_written = 0;
 	u16 m_lcd_pixels[LCD_WIDTH * LCD_HEIGHT]{};
 	u32 m_lcd_window_first = 0;
-	unsigned m_lcd_cursor = 0;
-	unsigned m_lcd_band_first = 0;
-	unsigned m_lcd_band_end = LCD_PAIRS;
-	unsigned m_lcd_limit = LCD_PAIRS;
+	u32 m_lcd_cursor = 0;
+	u32 m_lcd_band_first = 0;
+	u32 m_lcd_band_end = LCD_PAIRS;
+	u32 m_lcd_limit = LCD_PAIRS;
 	u8 m_lcd_command = 0;
 	u8 m_lcd_window_words = 0;
 	bool m_lcd_columns_valid = true;
@@ -303,8 +345,29 @@ private:
 	bool m_lcd_write = false;
 	bool m_lcd_pixel_header = false;
 	bool m_lcd_on = false;
-	std::string m_sti_line;
-	std::string m_nos_trace_line;
+};
+
+class ngage_qd_state : public ngage_state
+{
+public:
+	ngage_qd_state(machine_config const &mconfig, device_type type, char const *tag)
+		: ngage_state(mconfig, type, tag, QD_CS0_SIZE, 0xc0, 0x0800)
+		, m_qd_lcd(*this, "qd_lcd")
+	{
+	}
+
+	void qd(machine_config &config) ATTR_COLD;
+
+private:
+	void qd_map(address_map &map) ATTR_COLD;
+	virtual keypad_levels keypad_matrix(u8 row_low, u8 column_low) const override;
+	virtual u32 lcd_r(offs_t offset, u32 mem_mask) override;
+	virtual void lcd_w(offs_t offset, u32 data) override;
+	virtual void lcd_data_w(u32 data) override;
+	virtual bool lcd_dma_ready(u64 words) const override;
+	virtual u32 screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect) override;
+
+	required_device<ngage_qd_lcd_device> m_qd_lcd;
 };
 
 void ngage_state::machine_start()
@@ -318,7 +381,7 @@ void ngage_state::machine_start()
 
 	u32 const first = word32(0x174);
 	u32 const end = word32(0x178);
-	if (!((first | end) & 0xfff) && first < end && end <= cs0_size())
+	if (!((first | end) & 0xfff) && first < end && end <= m_cs0_size)
 	{
 		m_nos_start = first;
 		m_nos_end = end;
@@ -327,7 +390,7 @@ void ngage_state::machine_start()
 			m_decoded_nos.push_back(descramble_nos(m_flash[addr] | (m_flash[addr + 1] << 8), addr));
 	}
 
-	for (unsigned n = 0; n < std::size(m_timer); ++n)
+	for (u32 n = 0; n < std::size(m_timer); ++n)
 		m_timer[n] = timer_alloc(FUNC(ngage_state::timer_expired), this);
 	m_ctsi_compare_timer = timer_alloc(FUNC(ngage_state::ctsi_compare_expired), this);
 	m_mdi_timer = timer_alloc(FUNC(ngage_state::mdi_announce), this);
@@ -368,7 +431,6 @@ void ngage_state::machine_start()
 	save_item(NAME(m_mdi_pointers_seen));
 	save_item(NAME(m_mdi_announce_due));
 	save_item(NAME(m_mdi_announced));
-	save_item(NAME(m_adsp_controls_written));
 	save_item(NAME(m_euart_enable));
 	save_item(NAME(m_euart_batch_left));
 	save_item(NAME(m_euart_tx_index));
@@ -389,6 +451,14 @@ void ngage_state::machine_start()
 	save_item(STRUCT_MEMBER(m_mmc_dma, address));
 	save_item(STRUCT_MEMBER(m_mmc_dma, remaining));
 	save_item(STRUCT_MEMBER(m_mmc_dma, write));
+
+}
+
+void ngage_nem4_state::machine_start()
+{
+	ngage_state::machine_start();
+
+	save_item(NAME(m_adsp_controls_written));
 	save_item(NAME(m_lcd_pixels));
 	save_item(NAME(m_lcd_window_first));
 	save_item(NAME(m_lcd_cursor));
@@ -412,8 +482,6 @@ void ngage_state::machine_reset()
 	m_maincpu->set_unscaled_clock(ARM_SDRAM_CLOCK + (half_steps <= 4 ? half_steps : 0) * (ARM_SDRAM_CLOCK / 2));
 
 	finish_cdrive_erase();
-	if (!m_is_qd && (m_config->read() & REPAIR_CALENDAR_MIRROR))
-		recover_calendar_mirror();
 	std::fill(std::begin(m_flash_mode), std::end(m_flash_mode), ARRAY);
 	std::fill(std::begin(m_flash_unlock), std::end(m_flash_unlock), 0);
 	std::fill(std::begin(m_flash_operation), std::end(m_flash_operation), IDLE);
@@ -422,7 +490,7 @@ void ngage_state::machine_reset()
 	std::fill(std::begin(m_irq_enable), std::end(m_irq_enable), 0);
 	std::fill(std::begin(m_fiq_enable), std::end(m_fiq_enable), 0);
 	std::fill(std::begin(m_irq_pending), std::end(m_irq_pending), 0);
-	for (unsigned n = 0; n < std::size(m_timer); ++n)
+	for (u32 n = 0; n < std::size(m_timer); ++n)
 		set_timer_count(n, 0);
 	m_ctsi_fast_start = machine().time().as_ticks(CTSI_FAST_CLOCK);
 	m_ctsi_nos_start = machine().time().as_ticks(CTSI_NOS_CLOCK);
@@ -441,13 +509,10 @@ void ngage_state::machine_reset()
 	m_mdi_pointers_seen = 0;
 	m_mdi_announce_due = m_mdi_announced = false;
 	m_mdi_timer->enable(false);
-	m_adsp_controls_written = 0;
 	m_euart_enable = 0;
 	m_euart_batch_left = m_euart_tx_index = 0;
 	m_euart_tx_done = false;
 	m_euart_rx_producer = m_euart_rx_consumer = 0;
-	if (m_adsp)
-		m_adsp->power_w(false);
 	m_sim->set_present(BIT(m_config->read(), 0));
 	m_key_pending = 0;
 	m_key_row_drive = 0x3f;
@@ -460,35 +525,43 @@ void ngage_state::machine_reset()
 	for (auto *timer : m_lcd_dma_timer)
 		timer->enable(false);
 	std::fill(std::begin(m_mmc_dma), std::end(m_mmc_dma), mmc_dma_transfer{});
+	m_sti_line.clear();
+	m_nos_trace_line.clear();
+	update_interrupts();
+}
+
+void ngage_nem4_state::machine_reset()
+{
+	ngage_state::machine_reset();
+	recover_calendar_mirror();
+
+	m_adsp_controls_written = 0;
 	m_lcd_cursor = 0;
 	m_lcd_band_first = 0;
 	m_lcd_limit = m_lcd_band_end = LCD_PAIRS;
 	m_lcd_command = m_lcd_window_words = 0;
 	m_lcd_columns_valid = m_lcd_rows_valid = true;
 	m_lcd_write = m_lcd_pixel_header = m_lcd_on = false;
-	m_sti_line.clear();
-	m_nos_trace_line.clear();
-	update_interrupts();
 }
 
-template <unsigned Chip>
+template <u32 Chip>
 u8 *ngage_state::flash_storage(u32 addr)
 {
-	if (Chip == 0 && addr >= cs0_size() - PMM_SIZE)
-		return &m_pmm[addr - (cs0_size() - PMM_SIZE)];
+	if (Chip == 0 && addr >= m_cs0_size - PMM_SIZE)
+		return &m_pmm[addr - (m_cs0_size - PMM_SIZE)];
 	if (Chip == 1 && addr >= NOR_SIZE - CDRIVE_SIZE)
 		return &m_cdrive[addr - (NOR_SIZE - CDRIVE_SIZE)];
 	return nullptr;
 }
 
-template <unsigned Chip>
+template <u32 Chip, bool Samsung>
 u16 ngage_state::flash_r(offs_t offset)
 {
 	u32 const addr = offset * 2;
 	switch (m_flash_mode[Chip])
 	{
 	case IDENTIFY:
-		if (m_is_qd)
+		if constexpr (Samsung)
 		{
 			switch (addr & 0x1ff)
 			{
@@ -528,10 +601,11 @@ u16 ngage_state::flash_r(offs_t offset)
 	if (u8 const *const storage = flash_storage<Chip>(addr))
 		return storage[0] | (storage[1] << 8);
 
-	u32 const index = Chip == 0 ? addr : cs0_size() + (Chip - 1) * NOR_SIZE + addr;
+	u32 const index = Chip == 0 ? addr : m_cs0_size + (Chip - 1) * NOR_SIZE + addr;
 	return m_flash[index] | (m_flash[index + 1] << 8);
 }
 
+template <bool Samsung>
 u32 ngage_state::cdrive_r(offs_t offset, u32 mem_mask)
 {
 	u32 const addr = NOR_SIZE - CDRIVE_SIZE + offset * 4;
@@ -551,8 +625,8 @@ u32 ngage_state::cdrive_r(offs_t offset, u32 mem_mask)
 		return 0xffffffff;
 	}
 
-	u32 const low = (mem_mask & 0xffff) ? flash_r<1>(addr / 2) : 0;
-	u32 const high = (mem_mask & 0xffff0000) ? flash_r<1>(addr / 2 + 1) : 0;
+	u32 const low = (mem_mask & 0xffff) ? flash_r<1, Samsung>(addr / 2) : 0;
+	u32 const high = (mem_mask & 0xffff0000) ? flash_r<1, Samsung>(addr / 2 + 1) : 0;
 	return low | (high << 16);
 }
 
@@ -566,7 +640,7 @@ void ngage_state::finish_cdrive_erase()
 	}
 }
 
-template <unsigned Chip>
+template <u32 Chip, bool Samsung>
 void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
 {
 	u32 const addr = offset * 2;
@@ -574,12 +648,12 @@ void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
 	u8 &mode = m_flash_mode[Chip];
 	u8 &operation = m_flash_operation[Chip];
 	u8 *const storage = flash_storage<Chip>(addr);
-	u32 const chip_size = Chip == 0 ? cs0_size() : NOR_SIZE;
-	u32 const sector_size = m_is_qd ? (addr >= chip_size - PMM_SIZE ? 0x2000 : 0x10000)
+	u32 const chip_size = Chip == 0 ? m_cs0_size : NOR_SIZE;
+	u32 const sector_size = Samsung ? (addr >= chip_size - PMM_SIZE ? 0x2000 : 0x10000)
 		: (Chip == 0 || (addr & 0x1fffff) >= 0x1f0000 ? 0x4000 : 0x10000);
 	u32 const sector = addr & ~(sector_size - 1);
-	u32 const command_address = addr & (m_is_qd ? 0xfff : 0x7ff);
-	u32 const unlock_address = m_is_qd ? 0xaaa : 0x2aa;
+	u32 const command_address = addr & (Samsung ? 0xfff : 0x7ff);
+	u32 const unlock_address = Samsung ? 0xaaa : 0x2aa;
 
 	if (mem_mask != 0xffff)
 		return;
@@ -626,7 +700,7 @@ void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
 		operation = AMD_PROGRAM;
 	else if (unlock == 2 && command_address == unlock_address && data == 0x80)
 		operation = AMD_ERASE;
-	else if (m_is_qd && command_address == 0xaa && data == 0x98)
+	else if (Samsung && command_address == 0xaa && data == 0x98)
 		mode = CFI;
 	else if (data == 0x90 && ((unlock == 2 && command_address == unlock_address) || (!unlock && (addr == 0 || addr == 0xaaaa))))
 		mode = IDENTIFY;
@@ -639,7 +713,7 @@ void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
 		mode = STATUS;
 	else if (data == 0x50)
 		mode = ARRAY;
-	else if (!m_is_qd && data == 0x60)
+	else if (!Samsung && data == 0x60)
 	{
 		mode = PROTECTION;
 		m_flash_protection_bank[Chip] = addr >> 21;
@@ -663,7 +737,7 @@ void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
 		logerror("%s: unimplemented NOR CS%u write %04x at %06x\n", machine().describe_context(), Chip, data, addr);
 }
 
-u32 ngage_state::interrupt_sources(unsigned bank, bool fiq) const
+u32 ngage_state::interrupt_sources(u32 bank, bool fiq) const
 {
 	if (fiq)
 		return bank == 0 ? (m_irq_pending[0] & 0x3f) | ((m_sim->status() || (euart_status() & m_euart_enable)) ? (1U << 26) : 0) : 0;
@@ -694,7 +768,7 @@ void ngage_state::update_interrupts()
 
 	bool irq = false;
 	bool fiq = false;
-	for (unsigned n = 0; n < std::size(m_irq_pending); ++n)
+	for (u32 n = 0; n < std::size(m_irq_pending); ++n)
 	{
 		irq |= bool(interrupt_sources(n, false) & m_irq_enable[n]);
 		fiq |= bool(interrupt_sources(n, true) & m_fiq_enable[n]);
@@ -721,7 +795,7 @@ TIMER_CALLBACK_MEMBER(ngage_state::ctsi_compare_expired)
 	m_ctsi_compare_timer->adjust(attotime::from_ticks(0x10000, CTSI_NOS_CLOCK));
 }
 
-u32 ngage_state::timer_count(unsigned n) const
+u32 ngage_state::timer_count(u32 n) const
 {
 	if (!m_timer[n]->enabled())
 		return m_timer_stopped_count[n];
@@ -730,7 +804,7 @@ u32 ngage_state::timer_count(unsigned n) const
 	return (m_timer[n]->remaining() + attotime::from_ticks(1, GENERAL_TIMER_CLOCK)).as_ticks(GENERAL_TIMER_CLOCK);
 }
 
-void ngage_state::set_timer_count(unsigned n, u32 count)
+void ngage_state::set_timer_count(u32 n, u32 count)
 {
 	u32 const control = m_upp[(0x20a04 + n * 0x20) / 4];
 	m_timer_stopped_count[n] = count;
@@ -742,7 +816,7 @@ void ngage_state::set_timer_count(unsigned n, u32 count)
 
 TIMER_CALLBACK_MEMBER(ngage_state::timer_expired)
 {
-	unsigned const n = param;
+	u32 const n = param;
 	u32 const base = (0x20a00 + n * 0x20) / 4;
 	m_upp[base + 2] = 1;
 	m_irq_pending[0] |= 1U << n;
@@ -755,25 +829,28 @@ TIMER_CALLBACK_MEMBER(ngage_state::timer_expired)
 
 void ngage_state::recover_calendar_mirror()
 {
+	if (!(m_config->read() & REPAIR_CALENDAR_MIRROR))
+		return;
+
 	// Stock 4.03 can persist the two RTC calendar mirrors a minute apart.
 	// Its restore guard rejects that pair. Repair the older mirror only
 	// when both active records are unique and in the same native catalog.
-	static constexpr unsigned SECTOR_SIZE = 0x4000;
-	static constexpr unsigned HEADER_SIZE = 12;
+	static constexpr u32 SECTOR_SIZE = 0x4000;
+	static constexpr u32 HEADER_SIZE = 12;
 	u8 *records[2]{};
-	unsigned record_bank = PMM_SIZE;
-	for (unsigned bank = 0; bank < PMM_SIZE; bank += SECTOR_SIZE)
+	u32 record_bank = PMM_SIZE;
+	for (u32 bank = 0; bank < PMM_SIZE; bank += SECTOR_SIZE)
 	{
 		u8 *const sector = &m_pmm[bank];
 		if (std::memcmp(&sector[6], "PMMCAT", 6))
 			continue;
-		for (unsigned offset = 32; offset <= SECTOR_SIZE - HEADER_SIZE; )
+		for (u32 offset = 32; offset <= SECTOR_SIZE - HEADER_SIZE; )
 		{
 			u8 *const entry = &sector[offset];
 			if (entry[0] == 0xff)
 				break;
-			unsigned const length = get_u16le(&entry[8]);
-			unsigned const next = get_u16le(&entry[10]);
+			u32 const length = get_u16le(&entry[8]);
+			u32 const next = get_u16le(&entry[10]);
 			if (next != offset + HEADER_SIZE + length || next > SECTOR_SIZE)
 				return;
 			u16 const record = get_u16le(&entry[2]);
@@ -817,10 +894,10 @@ u16 ngage_state::uem_r(u8 reg) const
 	}
 	switch (reg)
 	{
-	case 0x24: return m_uem_rtc_calibration_written ? m_uem_regs[reg] : (m_is_qd ? 0xc0 : 1);
+	case 0x24: return m_uem_rtc_calibration_written ? m_uem_regs[reg] : m_rtc_calibration;
 	case 0x35: return m_uem_alarm_status | ((!m_power_key_released || BIT(m_keys, 26)) ? 0x10 : 0);
 	case 0x3a: return m_uem_adc_result;
-	case 0x3f: return (m_is_qd ? 0x0800 : 0) | ((!m_power_key_released || BIT(m_keys, 26)) ? 2 : 0);
+	case 0x3f: return m_uem_product_bits | ((!m_power_key_released || BIT(m_keys, 26)) ? 2 : 0);
 	case 0x80: return 0x0400;
 	default:   return m_uem_regs[reg];
 	}
@@ -835,11 +912,8 @@ TIMER_CALLBACK_MEMBER(ngage_state::uem_tick)
 void ngage_state::uem_w(u8 reg, u16 data)
 {
 	m_uem_regs[reg] = data;
-	if (m_adsp && (reg == 0x2f || reg == 0x30))
-	{
-		m_adsp_controls_written |= reg == 0x2f ? 1 : 2;
-		euart_update();
-	}
+	if (reg == 0x2f || reg == 0x30)
+		audio_dsp_uem_w(reg);
 	if (reg == 0x21 && u16(m_upp[0x50420 / 4]) == 7)
 		m_rtc->set_day(u8(data));
 	if (reg == 0x24)
@@ -853,7 +927,7 @@ void ngage_state::uem_w(u8 reg, u16 data)
 		{
 			ioport_field::user_settings battery;
 			m_config->field(BATTERY_LEVEL_MASK)->get_user_settings(battery);
-			unsigned const level = (battery.value & BATTERY_LEVEL_MASK) >> 4;
+			u32 const level = (battery.value & BATTERY_LEVEL_MASK) >> 4;
 			if (level < std::size(BATTERY_VOLTAGE_ADC))
 				m_uem_adc_result = BATTERY_VOLTAGE_ADC[level];
 		}
@@ -864,18 +938,18 @@ void ngage_state::uem_w(u8 reg, u16 data)
 		uem_tick(0);
 }
 
-u16 ngage_state::mdi_word(unsigned index) const
+u16 ngage_state::mdi_word(u32 index) const
 {
 	return m_upp[index / 2] >> ((index & 1) * 16);
 }
 
 void ngage_state::mdi_publish(std::span<u16 const> words)
 {
-	unsigned producer = u16(m_upp[MDI_RX_POINTERS]);
+	u32 producer = u16(m_upp[MDI_RX_POINTERS]);
 	for (u16 const word : words)
 	{
-		unsigned const index = MDI_RING_WORDS + producer;
-		unsigned const shift = (index & 1) * 16;
+		u32 const index = MDI_RING_WORDS + producer;
+		u32 const shift = (index & 1) * 16;
 		m_upp[index / 2] = (m_upp[index / 2] & ~(0xffffU << shift)) | (u32(word) << shift);
 		producer = (producer + 1) % MDI_RING_WORDS;
 	}
@@ -909,13 +983,13 @@ void ngage_state::mdi_update()
 	if (!m_mdi_announced && !m_mdi_announce_due && !m_mdi_timer->enabled())
 		m_mdi_timer->adjust(attotime::from_ticks(20, CTSI_NOS_CLOCK));
 
-	unsigned const producer = u16(m_upp[MDI_TX_POINTERS]);
-	unsigned consumer = m_upp[MDI_TX_POINTERS] >> 16;
-	unsigned const read_ptr = m_upp[MDI_RX_POINTERS] >> 16;
-	unsigned const write_ptr = u16(m_upp[MDI_RX_POINTERS]);
+	u32 const producer = u16(m_upp[MDI_TX_POINTERS]);
+	u32 consumer = m_upp[MDI_TX_POINTERS] >> 16;
+	u32 const read_ptr = m_upp[MDI_RX_POINTERS] >> 16;
+	u32 const write_ptr = u16(m_upp[MDI_RX_POINTERS]);
 	if (std::max({producer, consumer, read_ptr, write_ptr}) >= MDI_RING_WORDS)
 		return;
-	unsigned free = MDI_RING_WORDS - 1 - (write_ptr + MDI_RING_WORDS - read_ptr) % MDI_RING_WORDS;
+	u32 free = MDI_RING_WORDS - 1 - (write_ptr + MDI_RING_WORDS - read_ptr) % MDI_RING_WORDS;
 
 	if (m_mdi_announce_due)
 	{
@@ -926,7 +1000,7 @@ void ngage_state::mdi_update()
 		free -= std::size(ready);
 		m_mdi_announce_due = false;
 		m_mdi_announced = true;
-		logerror("UPP MDI: published DSP startup announcement\n");
+		LOGMASKED(LOG_MDI, "UPP MDI: published DSP startup announcement\n");
 	}
 
 	auto const publish_pcm = [this, &free]()
@@ -942,12 +1016,12 @@ void ngage_state::mdi_update()
 
 	while ((producer + MDI_RING_WORDS - consumer) % MDI_RING_WORDS >= 3)
 	{
-		auto const word = [this, consumer](unsigned index)
+		auto const word = [this, consumer](u32 index)
 		{
 			return mdi_word((consumer + index) % MDI_RING_WORDS);
 		};
-		unsigned const length = word(2) + 6;
-		unsigned const words = (length + 1) / 2;
+		u32 const length = word(2) + 6;
+		u32 const words = (length + 1) / 2;
 		if (words > (producer + MDI_RING_WORDS - consumer) % MDI_RING_WORDS)
 			break;
 
@@ -964,7 +1038,7 @@ void ngage_state::mdi_update()
 			if (!m_pcm->reply().empty() || free < ngage_pcm_device::REPLY_WORDS)
 				break;
 			u8 packet[24];
-			for (unsigned i = 0; i < words; ++i)
+			for (u32 i = 0; i < words; ++i)
 			{
 				u16 const value = word(i);
 				packet[i * 2] = value >> 8;
@@ -975,7 +1049,7 @@ void ngage_state::mdi_update()
 		}
 		else if (rf_version || sw_version)
 		{
-			unsigned const reply_words = rf_version ? 6 : 8;
+			u32 const reply_words = rf_version ? 6 : 8;
 			if (free < reply_words)
 				break;
 			u16 const reply[] = {
@@ -988,7 +1062,7 @@ void ngage_state::mdi_update()
 			};
 			mdi_publish(std::span(reply).first(reply_words));
 			free -= reply_words;
-			logerror("UPP MDI: replied to DSP %s version query\n", rf_version ? "RF" : "software");
+			LOGMASKED(LOG_MDI, "UPP MDI: replied to DSP %s version query\n", rf_version ? "RF" : "software");
 		}
 		consumer = (consumer + words) % MDI_RING_WORDS;
 		m_upp[MDI_TX_POINTERS] = (consumer << 16) | producer;
@@ -1004,21 +1078,34 @@ u16 ngage_state::euart_status() const
 
 void ngage_state::euart_update()
 {
-	if (m_adsp)
-	{
-		bool const powered = m_adsp_controls_written == 3 && !(m_uem_regs[0x2f] & 0xf0) && BIT(m_uem_regs[0x30], 5);
-		bool const receive_enabled = BIT(m_euart_enable, 3) && !(m_upp[0x50560 / 4] & 7);
-		m_adsp->power_w(powered);
-		while (receive_enabled && m_adsp->rx_pending() && ((m_euart_rx_producer + 1) & 15) != m_euart_rx_consumer)
-		{
-			m_euart_rx[m_euart_rx_producer] = m_adsp->rx_r();
-			m_euart_rx_producer = (m_euart_rx_producer + 1) & 15;
-		}
-	}
+	audio_dsp_receive();
 	update_interrupts();
 }
 
-void ngage_state::dma_start(unsigned channel)
+void ngage_nem4_state::audio_dsp_uem_w(u8 reg)
+{
+	m_adsp_controls_written |= reg == 0x2f ? 1 : 2;
+	euart_update();
+}
+
+void ngage_nem4_state::audio_dsp_tx_w(u8 data)
+{
+	m_adsp->tx_w(data);
+}
+
+void ngage_nem4_state::audio_dsp_receive()
+{
+	bool const powered = m_adsp_controls_written == 3 && !(m_uem_regs[0x2f] & 0xf0) && BIT(m_uem_regs[0x30], 5);
+	bool const receive_enabled = BIT(m_euart_enable, 3) && !(m_upp[0x50560 / 4] & 7);
+	m_adsp->power_w(powered);
+	while (receive_enabled && m_adsp->rx_pending() && ((m_euart_rx_producer + 1) & 15) != m_euart_rx_consumer)
+	{
+		m_euart_rx[m_euart_rx_producer] = m_adsp->rx_r();
+		m_euart_rx_producer = (m_euart_rx_producer + 1) & 15;
+	}
+}
+
+void ngage_state::dma_start(u32 channel)
 {
 	u32 const request = (m_upp[0x20064 / 4] >> (channel * 4)) & 15;
 	if (request == 2)
@@ -1110,7 +1197,7 @@ void ngage_state::mmc_dma_resume(u32 channel)
 	update_interrupts();
 }
 
-void ngage_state::lcd_dma_start(unsigned channel)
+void ngage_state::lcd_dma_start(u32 channel)
 {
 	if (m_lcd_dma_timer[channel]->enabled())
 		return;
@@ -1121,12 +1208,10 @@ void ngage_state::lcd_dma_start(unsigned channel)
 	u32 const destination = registers[8];
 	u64 const words = u64(registers[11]) + 1;
 	bool const sdram = source >= SDRAM_BASE && u64(source) + words * 4 <= SDRAM_END;
-	bool const panel_ready = m_qd_lcd ? m_qd_lcd->dma_ready(words)
-		: (m_lcd_pixel_header && m_lcd_write && m_lcd_cursor < m_lcd_limit && words <= m_lcd_limit - m_lcd_cursor);
 	if (registers[2] != 2 || registers[1] != 1 || request != 7 || !sdram || (source & 3)
 			|| registers[6] != 4 || registers[7] != 32 || registers[9] != 0 || registers[10] != 32
 			|| (destination != 0x10121208 && destination != 0x0c121208)
-			|| !panel_ready)
+			|| !lcd_dma_ready(words))
 	{
 		logerror("%s: unsupported UPP DMA channel %u transfer %08x to %08x (%u words)\n",
 			machine().describe_context(), channel, source, destination, words);
@@ -1137,13 +1222,7 @@ void ngage_state::lcd_dma_start(unsigned channel)
 	// transfer time of the 16-bit SDRAM interface, clocked 1:1 with the ARM.
 	address_space &program = m_maincpu->space(AS_PROGRAM);
 	for (u32 n = 0; n < words; ++n)
-	{
-		u32 const word = program.read_dword(source + n * 4);
-		if (m_qd_lcd)
-			m_qd_lcd->write(2, word);
-		else
-			lcd_data_w(word);
-	}
+		lcd_data_w(program.read_dword(source + n * 4));
 	m_lcd_dma_timer[channel]->adjust(attotime::from_ticks(words * 2, m_maincpu->unscaled_clock()), channel);
 }
 
@@ -1160,58 +1239,10 @@ ngage_state::keypad_levels ngage_state::keypad_read() const
 	u8 const column_data = m_upp[0x5040c / 4] & 0x3f;
 	u8 const row_low = m_key_row_drive & ~row_data & 0x1f;
 	u8 const column_low = m_key_column_drive & ~column_data;
-	u8 rows = ~row_low & 0x1f;
-	u8 columns = ~column_low & 0x3f;
-	if (m_is_qd)
-	{
-		// QD ekeyb table 3. Port D drives its five columns and port E
-		// reads its six rows. The classic N-Gage scans the other way.
-		static constexpr s8 positions[] = {
-			 0,  5,  1,  6,  9, 10,  4,  3, -1,  2, 27, 19, 12,
-			28, 24, 29, 17, 13, 18, 14, 22,  8, 23, 15,  7
-		};
-		for (unsigned key = 0; key < std::size(positions); ++key)
-		{
-			if (!BIT(m_keys, key) || positions[key] < 0)
-				continue;
-			unsigned const d = positions[key] % 5;
-			unsigned const e = positions[key] / 5;
-			if (BIT(row_low, d))
-				columns &= ~(1U << e);
-			if (BIT(column_low, e))
-				rows &= ~(1U << d);
-		}
-	}
-	else
-	{
-		for (unsigned column = 0; column < 6; ++column)
-		{
-			unsigned const first = column < 2 ? 5 + column * 2 : 9 + (column - 2) * 3;
-			unsigned const first_row = column < 2 ? 0 : 2;
-			unsigned const row_count = column < 2 ? 2 : 3;
-			for (unsigned i = 0; i < row_count; ++i)
-			{
-				if (!BIT(m_keys, first + i))
-					continue;
-				unsigned const row = first_row + i;
-				if (BIT(column_low, column))
-					rows &= ~(1U << row);
-				if (BIT(row_low, row))
-					columns &= ~(1U << column);
-			}
-			if (column >= 2 && BIT(m_keys, 19 + column) && BIT(m_key_row_drive, 5) && !m_key_gpio30)
-				columns &= ~(1U << column);
-		}
-	}
+	auto [rows, columns, inputs] = keypad_matrix(row_low, column_low);
 	rows = (rows & ~m_key_row_drive) | (row_data & m_key_row_drive);
 	columns = (columns & ~m_key_column_drive) | (column_data & m_key_column_drive);
 
-	static constexpr unsigned rocker_pins[] = { 1, 10, 13, 2, 11 };
-	u16 inputs = 0x3c06;
-	if (!m_is_qd)
-		for (unsigned i = 0; i < std::size(rocker_pins); ++i)
-			if (BIT(m_keys, i))
-				inputs &= ~(1U << rocker_pins[i]);
 	if (BIT(m_uem_regs[0x2a], 3) && !BIT(m_upp[0x50200 / 4], 16))
 		inputs &= ~2;
 
@@ -1223,6 +1254,61 @@ ngage_state::keypad_levels ngage_state::keypad_read() const
 	return { rows, columns, genio };
 }
 
+ngage_state::keypad_levels ngage_nem4_state::keypad_matrix(u8 row_low, u8 column_low) const
+{
+	u8 rows = ~row_low & 0x1f;
+	u8 columns = ~column_low & 0x3f;
+	for (u32 column = 0; column < 6; ++column)
+	{
+		u32 const first = column < 2 ? 5 + column * 2 : 9 + (column - 2) * 3;
+		u32 const first_row = column < 2 ? 0 : 2;
+		u32 const row_count = column < 2 ? 2 : 3;
+		for (u32 i = 0; i < row_count; ++i)
+		{
+			if (!BIT(m_keys, first + i))
+				continue;
+			u32 const row = first_row + i;
+			if (BIT(column_low, column))
+				rows &= ~(1U << row);
+			if (BIT(row_low, row))
+				columns &= ~(1U << column);
+		}
+		if (column >= 2 && BIT(m_keys, 19 + column) && BIT(m_key_row_drive, 5) && !m_key_gpio30)
+			columns &= ~(1U << column);
+	}
+
+	static constexpr u32 ROCKER_PINS[] = { 1, 10, 13, 2, 11 };
+	u16 genio = 0x3c06;
+	for (u32 i = 0; i < std::size(ROCKER_PINS); ++i)
+		if (BIT(m_keys, i))
+			genio &= ~(1U << ROCKER_PINS[i]);
+	return { rows, columns, genio };
+}
+
+ngage_state::keypad_levels ngage_qd_state::keypad_matrix(u8 row_low, u8 column_low) const
+{
+	u8 rows = ~row_low & 0x1f;
+	u8 columns = ~column_low & 0x3f;
+	// QD ekeyb table 3. Port D drives its five columns and port E
+	// reads its six rows. The classic N-Gage scans the other way.
+	static constexpr s8 positions[] = {
+		 0,  5,  1,  6,  9, 10,  4,  3, -1,  2, 27, 19, 12,
+		28, 24, 29, 17, 13, 18, 14, 22,  8, 23, 15,  7
+	};
+	for (u32 key = 0; key < std::size(positions); ++key)
+	{
+		if (!BIT(m_keys, key) || positions[key] < 0)
+			continue;
+		u32 const d = positions[key] % 5;
+		u32 const e = positions[key] / 5;
+		if (BIT(row_low, d))
+			columns &= ~(1U << e);
+		if (BIT(column_low, e))
+			rows &= ~(1U << d);
+	}
+	return { rows, columns, 0x3c06 };
+}
+
 void ngage_state::keypad_update()
 {
 	auto const levels = keypad_read();
@@ -1230,8 +1316,8 @@ void ngage_state::keypad_update()
 		m_key_pending |= 4;
 	u16 const direction = m_upp[0x5020c / 4] >> 16;
 	u16 const falling = m_key_last_genio & ~levels.genio & ~direction;
-	static constexpr unsigned pins[] = { 0, 10, 11, 13, 0, 1, 12, 2 };
-	for (unsigned i = 1; i < std::size(pins); ++i)
+	static constexpr u32 pins[] = { 0, 10, 11, 13, 0, 1, 12, 2 };
+	for (u32 i = 1; i < std::size(pins); ++i)
 		if (BIT(m_ctsi_genio_enable & (KEYPAD_EVENTS >> 16), i) && BIT(falling, pins[i]))
 			m_key_pending |= 1U << (16 + i);
 	m_key_last_columns = levels.columns;
@@ -1251,12 +1337,12 @@ u32 ngage_state::upp_r(offs_t offset, u32 mem_mask)
 	u32 const addr = offset * 4;
 	if (addr >= 0x20600 && addr < 0x20640)
 		return m_mmc->read((addr - 0x20600) / 4, mem_mask);
-	if (m_qd_lcd && addr >= 0x21200 && addr <= 0x21208)
-		return mem_mask == 0xffffffff ? m_qd_lcd->read((addr - 0x21200) / 4) : 0;
+	if (addr >= 0x21200 && addr <= 0x21208)
+		return lcd_r((addr - 0x21200) / 4, mem_mask);
 	if (addr >= 0x20100 && addr < 0x20280)
 	{
-		unsigned const plane = (addr - 0x20100) / 0xc0;
-		unsigned const bank = ((addr - 0x20100) % 0xc0) / 0x40;
+		u32 const plane = (addr - 0x20100) / 0xc0;
+		u32 const bank = ((addr - 0x20100) % 0xc0) / 0x40;
 		u32 const enabled = plane ? m_fiq_enable[bank] : m_irq_enable[bank];
 		u32 const sources = interrupt_sources(bank, plane != 0);
 		u32 const pending = sources & enabled;
@@ -1293,9 +1379,6 @@ u32 ngage_state::upp_r(offs_t offset, u32 mem_mask)
 		default: break;
 		}
 		break;
-	case 0x21200: return m_upp[offset] == 0x49200000 ? 0x40000000 : 0;
-	case 0x21204: return m_upp[offset] == 1 ? 4 : 0; // LCD FIFO ready
-	case 0x21208: return 0;
 	case 0x48000:
 	case 0x49000: return m_upp[offset] | 1; // DPLL lock, with settling time unmeasured.
 	case 0x4b000: return m_upp[offset] | 0x80;
@@ -1375,7 +1458,7 @@ u32 ngage_state::upp_r(offs_t offset, u32 mem_mask)
 	if (!machine().side_effects_disabled() && !m_upp_reads.test(offset))
 	{
 		m_upp_reads.set(offset);
-		logerror("%s: UPP read %08x mask %08x = %08x\n",
+		LOGMASKED(LOG_REGISTERS, "%s: UPP read %08x mask %08x = %08x\n",
 			machine().describe_context(), UPP_BASE + addr, mem_mask, m_upp[offset]);
 	}
 	return m_upp[offset];
@@ -1491,8 +1574,7 @@ void ngage_state::upp_w(offs_t offset, u32 data, u32 mem_mask)
 	case 0x50554:
 		if (mem_mask & 0xffff)
 		{
-			if (m_adsp)
-				m_adsp->tx_w(data >> 8);
+			audio_dsp_tx_w(data >> 8);
 			m_euart_tx_index = (m_euart_tx_index + 1) & 15;
 			if (m_euart_batch_left && !--m_euart_batch_left)
 				m_euart_tx_done = true;
@@ -1574,31 +1656,14 @@ void ngage_state::upp_w(offs_t offset, u32 data, u32 mem_mask)
 
 	if (addr >= 0x21200 && addr <= 0x21208 && mem_mask == 0xffffffff)
 	{
-		if (m_qd_lcd)
-			m_qd_lcd->write((addr - 0x21200) / 4, data);
-		else if (addr == 0x21204)
-		{
-			if (data == 2)
-			{
-				m_upp[0x21200 / 4] = 0;
-				m_lcd_window_words = 0;
-				m_lcd_pixel_header = false;
-			}
-		}
-		else if (m_upp[0x21204 / 4] == 1)
-		{
-			if (addr == 0x21200)
-				lcd_header_w(data);
-			else
-				lcd_data_w(data);
-		}
+		lcd_w((addr - 0x21200) / 4, data);
 		return;
 	}
 
 	if (addr >= 0x20100 && addr < 0x20280)
 	{
-		unsigned const plane = (addr - 0x20100) / 0xc0;
-		unsigned const bank = ((addr - 0x20100) % 0xc0) / 0x40;
+		u32 const plane = (addr - 0x20100) / 0xc0;
+		u32 const bank = ((addr - 0x20100) % 0xc0) / 0x40;
 		u32 &enabled = plane ? m_fiq_enable[bank] : m_irq_enable[bank];
 		if ((addr & 0x3f) == 8)
 			enabled |= data & mem_mask;
@@ -1613,8 +1678,8 @@ void ngage_state::upp_w(offs_t offset, u32 data, u32 mem_mask)
 	}
 	if (addr >= 0x20300 && addr < 0x20500)
 	{
-		unsigned const channel = (addr - 0x20300) / 0x40;
-		unsigned const reg = addr & 0x3f;
+		u32 const channel = (addr - 0x20300) / 0x40;
+		u32 const reg = addr & 0x3f;
 		if ((reg == 4 || reg == 8) && !m_upp[offset])
 		{
 			m_lcd_dma_timer[channel]->enable(false);
@@ -1631,7 +1696,7 @@ void ngage_state::upp_w(offs_t offset, u32 data, u32 mem_mask)
 	}
 	if (addr >= 0x20a00 && addr < 0x20ac0)
 	{
-		unsigned const n = (addr - 0x20a00) / 0x20;
+		u32 const n = (addr - 0x20a00) / 0x20;
 		switch (addr & 0x1f)
 		{
 		case 0x04:
@@ -1652,12 +1717,47 @@ void ngage_state::upp_w(offs_t offset, u32 data, u32 mem_mask)
 	if (!m_upp_writes.test(offset))
 	{
 		m_upp_writes.set(offset);
-		logerror("%s: UPP write %08x mask %08x = %08x\n",
+		LOGMASKED(LOG_REGISTERS, "%s: UPP write %08x mask %08x = %08x\n",
 			machine().describe_context(), UPP_BASE + addr, mem_mask, data);
 	}
 }
 
-void ngage_state::lcd_header_w(u32 data)
+u32 ngage_nem4_state::lcd_r(offs_t offset, u32 mem_mask)
+{
+	switch (offset)
+	{
+	case 0: return m_upp[0x21200 / 4] == 0x49200000 ? 0x40000000 : 0;
+	case 1: return m_upp[0x21204 / 4] == 1 ? 4 : 0; // LCD FIFO ready
+	default: return 0;
+	}
+}
+
+void ngage_nem4_state::lcd_w(offs_t offset, u32 data)
+{
+	if (offset == 1)
+	{
+		if (data == 2)
+		{
+			m_upp[0x21200 / 4] = 0;
+			m_lcd_window_words = 0;
+			m_lcd_pixel_header = false;
+		}
+	}
+	else if (m_upp[0x21204 / 4] == 1)
+	{
+		if (offset == 0)
+			lcd_header_w(data);
+		else
+			lcd_data_w(data);
+	}
+}
+
+bool ngage_nem4_state::lcd_dma_ready(u64 words) const
+{
+	return m_lcd_pixel_header && m_lcd_write && m_lcd_cursor < m_lcd_limit && words <= m_lcd_limit - m_lcd_cursor;
+}
+
+void ngage_nem4_state::lcd_header_w(u32 data)
 {
 	m_lcd_window_words = 0;
 	if (data == 0x09240003 && (m_lcd_command == 0x15 || m_lcd_command == 0x75))
@@ -1671,7 +1771,7 @@ void ngage_state::lcd_header_w(u32 data)
 		&& ((data & 0xffff) + 1) == (m_lcd_band_end - m_lcd_band_first) * 3);
 }
 
-void ngage_state::lcd_data_w(u32 data)
+void ngage_nem4_state::lcd_data_w(u32 data)
 {
 	u32 const header = m_upp[0x21200 / 4];
 	if (header == 0x09200000)
@@ -1697,8 +1797,8 @@ void ngage_state::lcd_data_w(u32 data)
 			m_lcd_columns_valid = data == 0 && m_lcd_window_first == 0x0b100002;
 		else
 		{
-			unsigned const start = m_lcd_window_first & 0xff;
-			unsigned const end = (m_lcd_window_first >> 20) & 0xff;
+			u32 const start = m_lcd_window_first & 0xff;
+			u32 const end = (m_lcd_window_first >> 20) & 0xff;
 			m_lcd_rows_valid = data == 0 && !(m_lcd_window_first & 0xf00fff00)
 				&& start < end && end <= LCD_HEIGHT;
 			if (m_lcd_rows_valid)
@@ -1717,11 +1817,9 @@ void ngage_state::lcd_data_w(u32 data)
 	}
 }
 
-u32 ngage_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect)
+u32 ngage_nem4_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect)
 {
-	if (m_qd_lcd)
-		m_qd_lcd->draw(bitmap, cliprect);
-	else if (m_lcd_on)
+	if (m_lcd_on)
 	{
 		for (int y = cliprect.top(); y <= cliprect.bottom(); ++y)
 		{
@@ -1737,12 +1835,38 @@ u32 ngage_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rect
 	return 0;
 }
 
+u32 ngage_qd_state::lcd_r(offs_t offset, u32 mem_mask)
+{
+	return mem_mask == 0xffffffff ? m_qd_lcd->read(offset) : 0;
+}
+
+void ngage_qd_state::lcd_w(offs_t offset, u32 data)
+{
+	m_qd_lcd->write(offset, data);
+}
+
+void ngage_qd_state::lcd_data_w(u32 data)
+{
+	m_qd_lcd->write(2, data);
+}
+
+bool ngage_qd_state::lcd_dma_ready(u64 words) const
+{
+	return m_qd_lcd->dma_ready(words);
+}
+
+u32 ngage_qd_state::screen_update(screen_device &screen, bitmap_rgb32 &bitmap, rectangle const &cliprect)
+{
+	m_qd_lcd->draw(bitmap, cliprect);
+	return 0;
+}
+
 void ngage_state::sti_w(offs_t offset, u8 data)
 {
 	if ((offset == 0 && data == 0xc0) || (offset == 0x1d0000 && data == 0xe0) || m_sti_line.size() == 256)
 	{
 		if (!m_sti_line.empty())
-			logerror("STI: %s\n", m_sti_line);
+			LOGMASKED(LOG_FIRMWARE, "STI: %s\n", m_sti_line);
 		m_sti_line.clear();
 	}
 	if ((data >= 0x20 && data < 0x7f) || data == '\t')
@@ -1751,7 +1875,7 @@ void ngage_state::sti_w(offs_t offset, u8 data)
 
 void ngage_state::nos_trace_w(u32 data, u32 mem_mask)
 {
-	for (unsigned lane = 0; lane < 4; ++lane)
+	for (u32 lane = 0; lane < 4; ++lane)
 	{
 		if (!(mem_mask & (0xffU << (8 * lane))))
 			continue;
@@ -1759,7 +1883,7 @@ void ngage_state::nos_trace_w(u32 data, u32 mem_mask)
 		if (!byte || byte == 0xc3 || m_nos_trace_line.size() == 256)
 		{
 			if (!m_nos_trace_line.empty())
-				logerror("NOS: %s\n", m_nos_trace_line);
+				LOGMASKED(LOG_FIRMWARE, "NOS: %s\n", m_nos_trace_line);
 			m_nos_trace_line.clear();
 		}
 		if (byte >= 0x20 && byte < 0x7f)
@@ -1767,11 +1891,12 @@ void ngage_state::nos_trace_w(u32 data, u32 mem_mask)
 	}
 }
 
+template <bool Samsung>
 void ngage_state::common_map(address_map &map)
 {
-	map(0x02000000, 0x023fffff).r(FUNC(ngage_state::flash_r<1>));
-	map(0x02400000, 0x027fffff).r(FUNC(ngage_state::cdrive_r));
-	map(0x02000000, 0x027fffff).w(FUNC(ngage_state::flash_w<1>));
+	map(0x02000000, 0x023fffff).r(&ngage_state::flash_r<1, Samsung>, "flash_r");
+	map(0x02400000, 0x027fffff).r(FUNC(ngage_state::cdrive_r<Samsung>));
+	map(0x02000000, 0x027fffff).w(&ngage_state::flash_w<1, Samsung>, "flash_w");
 	map(0x08000000, 0x08000fff).ram(); // External memory controller latches
 	map(SDRAM_BASE, SDRAM_END - 1).ram();
 	map(UPP_ROM_BASE, UPP_ROM_BASE + UPP_ROM_SIZE - 1).rom().region("upp_rom", 0);
@@ -1785,20 +1910,20 @@ void ngage_state::common_map(address_map &map)
 	map(0x0de00000, 0x0dffffff).w(FUNC(ngage_state::sti_w));
 }
 
-void ngage_state::nem4_map(address_map &map)
+void ngage_nem4_state::nem4_map(address_map &map)
 {
-	common_map(map);
-	map(0x00000000, 0x007fffff).rw(FUNC(ngage_state::flash_r<0>), FUNC(ngage_state::flash_w<0>));
-	map(0x04000000, 0x047fffff).rw(FUNC(ngage_state::flash_r<2>), FUNC(ngage_state::flash_w<2>));
+	common_map<false>(map);
+	map(0x00000000, 0x007fffff).rw(&ngage_nem4_state::flash_r<0, false>, "flash_r", &ngage_nem4_state::flash_w<0, false>, "flash_w");
+	map(0x04000000, 0x047fffff).rw(&ngage_nem4_state::flash_r<2, false>, "flash_r", &ngage_nem4_state::flash_w<2, false>, "flash_w");
 }
 
-void ngage_state::qd_map(address_map &map)
+void ngage_qd_state::qd_map(address_map &map)
 {
-	common_map(map);
-	map(0x00000000, 0x00ffffff).rw(FUNC(ngage_state::flash_r<0>), FUNC(ngage_state::flash_w<0>));
+	common_map<true>(map);
+	map(0x00000000, 0x00ffffff).rw(&ngage_qd_state::flash_r<0, true>, "flash_r", &ngage_qd_state::flash_w<0, true>, "flash_w");
 }
 
-void ngage_state::common(machine_config &config)
+void ngage_state::common(machine_config &config, bool mmc_hot_swap)
 {
 	ARM920T(config, m_maincpu, ARM_SDRAM_CLOCK);
 	NVRAM(config, m_pmm_nvram, nvram_device::DEFAULT_ALL_1);
@@ -1806,6 +1931,7 @@ void ngage_state::common(machine_config &config)
 	NGAGE_BT(config, m_bt, 0);
 	m_bt->irq_cb().set(FUNC(ngage_state::bt_event));
 	NGAGE_MMC(config, m_mmc, 8'666'667);
+	m_mmc->set_hot_swap(mmc_hot_swap);
 	NGAGE_RTC(config, m_rtc, 0);
 	m_mmc->event_cb().set(FUNC(ngage_state::mmc_event));
 	m_mmc->media_change_cb().set(FUNC(ngage_state::mmc_media_changed));
@@ -1820,19 +1946,18 @@ void ngage_state::common(machine_config &config)
 	screen.set_screen_update(FUNC(ngage_state::screen_update));
 }
 
-void ngage_state::nem4(machine_config &config)
+void ngage_nem4_state::nem4(machine_config &config)
 {
-	common(config);
-	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_state::nem4_map);
+	common(config, false);
+	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_nem4_state::nem4_map);
 	NGAGE_ADSP(config, m_adsp, 0);
 }
 
-void ngage_state::qd(machine_config &config)
+void ngage_qd_state::qd(machine_config &config)
 {
-	common(config);
-	m_mmc->set_hot_swap(true);
+	common(config, true);
 	NGAGE_QD_LCD(config, m_qd_lcd, 0);
-	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_state::qd_map);
+	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_qd_state::qd_map);
 }
 
 INPUT_PORTS_START(ngage)
@@ -1899,9 +2024,14 @@ INPUT_PORTS_START(ngageqd)
 	PORT_BIT(0x02000000, IP_ACTIVE_HIGH, IPT_UNUSED) // Music
 INPUT_PORTS_END
 
-// The C: regions are defaults for virgin NVRAM. These service-profile
-// LFFS images were generated in fresh guests with only system data.
-// Existing saves load through the NVRAM device in preference to the region.
+// The NOR images assemble Nokia Phoenix MCU and PPM flash records, taking
+// language pack ranges from the PPM and preserving scrambled bytes. The
+// NEM-4 images are split into three 8 MiB chip selects and the QD images
+// into 16 MiB CS0 and 8 MiB CS1. Erased areas are filled with 0xff.
+// The C: regions contain default LFFS volumes generated by fresh guests
+// running the corresponding firmware with only system data.
+
+// NEM-4 4.03 MCU nem440.3c1 and PPM nem440.326.
 ROM_START(ngage)
 	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
 	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
@@ -1915,6 +2045,7 @@ ROM_START(ngage)
 	ROM_LOAD("nem4_403_cdrive.bin", 0, CDRIVE_SIZE, CRC(04981d42) SHA1(e9262db589cabdd00ab9a4df6659b56a86a1f259))
 ROM_END
 
+// RH-29 4.10 MCU RH2941.0C1 and PPM RH2941.021.
 ROM_START(ngageqd)
 	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
 	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
@@ -1927,6 +2058,7 @@ ROM_START(ngageqd)
 	ROM_LOAD("rh29_410_cdrive.bin", 0, CDRIVE_SIZE, CRC(f48e64d2) SHA1(70dc94e43f285184871f866fbbb7a0e6f0967b20))
 ROM_END
 
+// NEM-4 4.17 MCU nem441.7d1 (CRC32 adfd7b51) and PPM nem441.738.
 ROM_START(ngage417)
 	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
 	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
@@ -1940,6 +2072,7 @@ ROM_START(ngage417)
 	ROM_LOAD("nem4_417_cdrive.bin", 0, CDRIVE_SIZE, CRC(cca69008) SHA1(341a1330f9ab8bb917bc32891677986ffd390d1d))
 ROM_END
 
+// RH-29 4.15 MCU rh2941.5C1 and PPM rh2941.570.
 ROM_START(ngageqd415)
 	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
 	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
@@ -1954,7 +2087,7 @@ ROM_END
 
 } // anonymous namespace
 
-SYST(2003, ngage, 0, 0, nem4, ngage, ngage_state, empty_init, "Nokia", "N-Gage (NEM-4, firmware 4.03)", MACHINE_NOT_WORKING)
-SYST(2004, ngageqd, 0, 0, qd, ngageqd, ngage_state, init_qd, "Nokia", "N-Gage QD (RH-29, firmware 4.10)", MACHINE_NOT_WORKING)
-SYST(2004, ngage417, ngage, 0, nem4, ngage, ngage_state, empty_init, "Nokia", "N-Gage (NEM-4, firmware 4.17)", MACHINE_NOT_WORKING)
-SYST(2004, ngageqd415, ngageqd, 0, qd, ngageqd, ngage_state, init_qd, "Nokia", "N-Gage QD (RH-29, firmware 4.15)", MACHINE_NOT_WORKING)
+SYST(2003, ngage, 0, 0, nem4, ngage, ngage_nem4_state, empty_init, "Nokia", "N-Gage (NEM-4, firmware 4.03)", MACHINE_NOT_WORKING)
+SYST(2004, ngageqd, 0, 0, qd, ngageqd, ngage_qd_state, empty_init, "Nokia", "N-Gage QD (RH-29, firmware 4.10)", MACHINE_NOT_WORKING)
+SYST(2004, ngage417, ngage, 0, nem4, ngage, ngage_nem4_state, empty_init, "Nokia", "N-Gage (NEM-4, firmware 4.17)", MACHINE_NOT_WORKING)
+SYST(2004, ngageqd415, ngageqd, 0, qd, ngageqd, ngage_qd_state, empty_init, "Nokia", "N-Gage QD (RH-29, firmware 4.15)", MACHINE_NOT_WORKING)

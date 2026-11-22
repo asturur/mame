@@ -10,7 +10,7 @@
 
 namespace {
 
-u16 frame_word(std::span<u8 const> packet, unsigned offset)
+u16 frame_word(std::span<u8 const> packet, u32 offset)
 {
 	return (u16(packet[offset]) << 8) | packet[offset + 1];
 }
@@ -33,6 +33,29 @@ ngage_pcm_device::ngage_pcm_device(machine_config const &mconfig, char const *ta
 	: device_t(mconfig, NGAGE_PCM, tag, owner, clock)
 	, device_sound_interface(mconfig, *this)
 	, m_reply_ready(*this)
+	, m_memory(nullptr)
+	, m_memory_start(0)
+	, m_memory_end(0)
+	, m_reply{}
+	, m_media(0)
+	, m_device(0)
+	, m_object(0)
+	, m_dsp_device(0)
+	, m_dsp_object(0)
+	, m_reply_pending(false)
+	, m_open(false)
+	, m_first(true)
+	, m_final_done(false)
+	, m_requested(NO_HALF)
+	, m_final(NO_HALF)
+	, m_playing(NO_HALF)
+	, m_free(0)
+	, m_capacity(0)
+	, m_final_frames(0)
+	, m_address{}
+	, m_frames{}
+	, m_output_position(0)
+	, m_repeat(1)
 {
 }
 
@@ -136,7 +159,7 @@ void ngage_pcm_device::service_reply()
 	}
 	else if (m_final == NO_HALF && m_requested == NO_HALF && m_free)
 	{
-		m_requested = std::countr_zero(unsigned(m_free));
+		m_requested = std::countr_zero(u32(m_free));
 		m_free &= ~(1U << m_requested);
 		make_reply(0, 0x26, m_requested);
 	}
