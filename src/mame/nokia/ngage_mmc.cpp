@@ -1,6 +1,6 @@
 // license:GPL-2.0+
 // copyright-holders:Andrea Bogazzi
-// NEM-4 UPP native MMC host and byte-addressed card at transaction level.
+// N-Gage UPP native MMC host and byte-addressed card at transaction level.
 // The card image supplies the sectors and optionally the original CID/CSD/OCR.
 
 #include "emu.h"
@@ -73,6 +73,11 @@ void ngage_mmc_device::device_start()
 void ngage_mmc_device::device_reset()
 {
 	std::fill(std::begin(m_reg), std::end(m_reg), 0);
+	reset_card();
+}
+
+void ngage_mmc_device::reset_card()
+{
 	m_status = 0;
 	m_type = m_command = m_argument = 0;
 	m_response_words = m_response_pos = 0;
@@ -158,7 +163,17 @@ std::pair<std::error_condition, std::string> ngage_mmc_device::call_load()
 void ngage_mmc_device::call_unload()
 {
 	m_payload_size = 0;
-	device_reset();
+	if (m_hot_swap && machine().phase() == machine_phase::RUNNING)
+	{
+		// Removing a card aborts its transactions without resetting the UPP host registers.
+		u32 const status = ((m_status & CMD_BUSY) && m_type ? RESP_TIMEOUT : 0)
+			| (m_status & DATA_BUSY ? DATA_TIMEOUT : 0);
+		reset_card();
+		m_status = status;
+		m_event_cb(1);
+	}
+	else
+		device_reset();
 }
 
 u32 ngage_mmc_device::irq_sources() const
@@ -357,11 +372,10 @@ void ngage_mmc_device::card_command()
 		break;
 	case 13:
 		if (addressed && m_card_state >= STANDBY && m_card_state != INACTIVE)
-		{
 			response(r1);
-			return;
-		}
-		break;
+		else if (m_type)
+			m_status |= RESP_TIMEOUT; // An unaddressed card does not answer the QD's status poll.
+		return;
 	case 15:
 		if (addressed)
 			m_card_state = INACTIVE;

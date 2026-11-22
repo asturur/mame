@@ -148,6 +148,7 @@ protected:
 private:
 	void nem4_map(address_map &map) ATTR_COLD;
 	void qd_map(address_map &map) ATTR_COLD;
+	void common(machine_config &config) ATTR_COLD;
 	void common_map(address_map &map) ATTR_COLD;
 	u32 cs0_size() const { return m_is_qd ? QD_CS0_SIZE : NOR_SIZE; }
 	template <unsigned Chip> u16 flash_r(offs_t offset);
@@ -199,7 +200,7 @@ private:
 	required_region_ptr<u8> m_flash;
 	required_device<nvram_device> m_pmm_nvram;
 	required_device<nvram_device> m_cdrive_nvram;
-	required_device<ngage_adsp_device> m_adsp;
+	optional_device<ngage_adsp_device> m_adsp;
 	required_device<ngage_bt_device> m_bt;
 	required_device<ngage_mmc_device> m_mmc;
 	required_device<ngage_rtc_device> m_rtc;
@@ -427,7 +428,8 @@ void ngage_state::machine_reset()
 	m_euart_batch_left = m_euart_tx_index = 0;
 	m_euart_tx_done = false;
 	m_euart_rx_producer = m_euart_rx_consumer = 0;
-	m_adsp->power_w(false);
+	if (m_adsp)
+		m_adsp->power_w(false);
 	m_sim->set_present(BIT(m_config->read(), 0));
 	m_key_pending = 0;
 	m_key_row_drive = 0x3f;
@@ -814,7 +816,7 @@ TIMER_CALLBACK_MEMBER(ngage_state::uem_tick)
 void ngage_state::uem_w(u8 reg, u16 data)
 {
 	m_uem_regs[reg] = data;
-	if (reg == 0x2f || reg == 0x30)
+	if (m_adsp && (reg == 0x2f || reg == 0x30))
 	{
 		m_adsp_controls_written |= reg == 0x2f ? 1 : 2;
 		euart_update();
@@ -983,13 +985,16 @@ u16 ngage_state::euart_status() const
 
 void ngage_state::euart_update()
 {
-	bool const powered = m_adsp_controls_written == 3 && !(m_uem_regs[0x2f] & 0xf0) && BIT(m_uem_regs[0x30], 5);
-	bool const receive_enabled = BIT(m_euart_enable, 3) && !(m_upp[0x50560 / 4] & 7);
-	m_adsp->power_w(powered && receive_enabled);
-	while (m_adsp->rx_pending() && ((m_euart_rx_producer + 1) & 15) != m_euart_rx_consumer)
+	if (m_adsp)
 	{
-		m_euart_rx[m_euart_rx_producer] = m_adsp->rx_r();
-		m_euart_rx_producer = (m_euart_rx_producer + 1) & 15;
+		bool const powered = m_adsp_controls_written == 3 && !(m_uem_regs[0x2f] & 0xf0) && BIT(m_uem_regs[0x30], 5);
+		bool const receive_enabled = BIT(m_euart_enable, 3) && !(m_upp[0x50560 / 4] & 7);
+		m_adsp->power_w(powered && receive_enabled);
+		while (m_adsp->rx_pending() && ((m_euart_rx_producer + 1) & 15) != m_euart_rx_consumer)
+		{
+			m_euart_rx[m_euart_rx_producer] = m_adsp->rx_r();
+			m_euart_rx_producer = (m_euart_rx_producer + 1) & 15;
+		}
 	}
 	update_interrupts();
 }
@@ -1425,7 +1430,8 @@ void ngage_state::upp_w(offs_t offset, u32 data, u32 mem_mask)
 	case 0x50554:
 		if (mem_mask & 0xffff)
 		{
-			m_adsp->tx_w(data >> 8);
+			if (m_adsp)
+				m_adsp->tx_w(data >> 8);
 			m_euart_tx_index = (m_euart_tx_index + 1) & 15;
 			if (m_euart_batch_left && !--m_euart_batch_left)
 				m_euart_tx_done = true;
@@ -1724,13 +1730,11 @@ void ngage_state::qd_map(address_map &map)
 	map(0x00000000, 0x00ffffff).rw(FUNC(ngage_state::flash_r<0>), FUNC(ngage_state::flash_w<0>));
 }
 
-void ngage_state::nem4(machine_config &config)
+void ngage_state::common(machine_config &config)
 {
 	ARM920T(config, m_maincpu, ARM_SDRAM_CLOCK);
-	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_state::nem4_map);
 	NVRAM(config, m_pmm_nvram, nvram_device::DEFAULT_ALL_1);
 	NVRAM(config, m_cdrive_nvram, nvram_device::DEFAULT_ALL_1);
-	NGAGE_ADSP(config, m_adsp, 0);
 	NGAGE_BT(config, m_bt, 0);
 	m_bt->irq_cb().set(FUNC(ngage_state::bt_event));
 	NGAGE_MMC(config, m_mmc, 8'666'667);
@@ -1747,9 +1751,17 @@ void ngage_state::nem4(machine_config &config)
 	screen.set_screen_update(FUNC(ngage_state::screen_update));
 }
 
+void ngage_state::nem4(machine_config &config)
+{
+	common(config);
+	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_state::nem4_map);
+	NGAGE_ADSP(config, m_adsp, 0);
+}
+
 void ngage_state::qd(machine_config &config)
 {
-	nem4(config);
+	common(config);
+	m_mmc->set_hot_swap(true);
 	NGAGE_QD_LCD(config, m_qd_lcd, 0);
 	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_state::qd_map);
 }
@@ -1812,17 +1824,26 @@ INPUT_PORTS_START(ngageqd)
 	PORT_BIT(0x02000000, IP_ACTIVE_HIGH, IPT_UNUSED) // Music
 INPUT_PORTS_END
 
+// The C: regions are defaults for virgin NVRAM. These service-profile
+// LFFS images were generated in fresh guests with only system data.
+// Existing saves load through the NVRAM device in preference to the region.
 ROM_START(ngage)
 	ROM_REGION(0x1800000, "flash", 0)
 	ROM_LOAD("nem4_403_cs0.bin", 0x0000000, 0x800000, CRC(848f1c33) SHA1(1c420c64b15579706e9c3374f6dafc863825e9d7))
 	ROM_LOAD("nem4_403_cs1.bin", 0x0800000, 0x800000, CRC(8e8ace41) SHA1(33448698969d26af0984ae6a6716cfd9841c7fa5))
 	ROM_LOAD("nem4_403_cs2.bin", 0x1000000, 0x800000, CRC(436711c7) SHA1(21141142b373098c0871a3daa10238c694766ef4))
+
+	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
+	ROM_LOAD("nem4_403_cdrive.bin", 0, CDRIVE_SIZE, CRC(04981d42) SHA1(e9262db589cabdd00ab9a4df6659b56a86a1f259))
 ROM_END
 
 ROM_START(ngageqd)
 	ROM_REGION(0x1800000, "flash", 0)
 	ROM_LOAD("rh29_410_cs0.bin", 0x0000000, 0x1000000, CRC(ec170b2c) SHA1(78879c4f6c83a6fbd9c5bc30d8de6ae50db8d898))
 	ROM_LOAD("rh29_410_cs1.bin", 0x1000000, 0x800000, CRC(a276df3a) SHA1(9fd6364bff02167db339e1d89ec0cade5de4e48e))
+
+	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
+	ROM_LOAD("rh29_410_cdrive.bin", 0, CDRIVE_SIZE, CRC(f48e64d2) SHA1(70dc94e43f285184871f866fbbb7a0e6f0967b20))
 ROM_END
 
 ROM_START(ngage417)
@@ -1830,12 +1851,18 @@ ROM_START(ngage417)
 	ROM_LOAD("nem4_417_cs0.bin", 0x0000000, 0x800000, CRC(dd63247f) SHA1(d9def4cf64f885737cee562ace349d7c22e4b387))
 	ROM_LOAD("nem4_417_cs1.bin", 0x0800000, 0x800000, CRC(38f7a1c1) SHA1(e3401877ac47380d3795718b69df1edd0b8f2e3b))
 	ROM_LOAD("nem4_417_cs2.bin", 0x1000000, 0x800000, CRC(f8f93ab7) SHA1(df266bebd73e63398fdf29e1d5651476fac3e582))
+
+	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
+	ROM_LOAD("nem4_417_cdrive.bin", 0, CDRIVE_SIZE, CRC(cca69008) SHA1(341a1330f9ab8bb917bc32891677986ffd390d1d))
 ROM_END
 
 ROM_START(ngageqd415)
 	ROM_REGION(0x1800000, "flash", 0)
 	ROM_LOAD("rh29_415_cs0.bin", 0x0000000, 0x1000000, CRC(22e846cc) SHA1(b3081f5c82b574ddd1d3ce28bd300f132a920849))
 	ROM_LOAD("rh29_415_cs1.bin", 0x1000000, 0x800000, CRC(b59ec15b) SHA1(f21b6ed8fbff202f666365931cba657ac97168ce))
+
+	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
+	ROM_LOAD("rh29_415_cdrive.bin", 0, CDRIVE_SIZE, CRC(77ec1a78) SHA1(2641a3c53d16b77a9b4dd73a08d215775bc7a166))
 ROM_END
 
 } // anonymous namespace

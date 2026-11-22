@@ -1,30 +1,123 @@
 // license:GPL-2.0+
 // copyright-holders:Andrea Bogazzi
 /*
-    NEM-4 D550 audio DSP startup link.
+    NEM-4 D550 (TMS320DA250GHH-144) audio DSP startup stub.
 
-    The startup packets and XOR16 framing follow the original C55x startup
-    trace and the MiSTer D550 peer. Diagnostic 0x42 models the nominal clock,
-    D551 boot signature and N501 codec reset used by the original test. The
-    audio processor, codec samples and unrelated application services are
-    unimplemented.
+    The Nokia Phoenix NEM_4.ini lists E403A400H450.USB as its AdspFile.
+    D551 is a 2 MiB NOR, of which the service file supplies 0x16fc4a bytes.
+    The provisional C55x program-byte map follows the vectors and code
+    cross-references documented in the MiSTer ADSP ROM investigation.
+    The stub copies the recovered load records into its boot RAM.
+
+    The startup packets and XOR16 framing follow the original trace and
+    the MiSTer D550 peer. Diagnostic 0x42 checks the mapped D551 signature;
+    the clock and N501 codec reset are modeled as ready. C55x execution,
+    audio output and general application services are unimplemented.
 */
 
 #include "emu.h"
 #include "ngage_adsp.h"
 
-#include <algorithm>
+#include "multibyte.h"
 
-DEFINE_DEVICE_TYPE(NGAGE_ADSP, ngage_adsp_device, "ngage_adsp", "N-Gage D550 Audio DSP")
+#include <algorithm>
+#include <array>
+
+namespace {
+
+constexpr u32 BOOT_RAM_BYTES = 0x40000;
+constexpr u32 D551_BASE = 0x400000;
+constexpr u32 D551_IMAGE_BYTES = 0x16fc4a;
+constexpr u32 D551_MARKER_ADDRESS = D551_BASE + 0x160000;
+constexpr u16 D551_MARKER = 0xfffc;
+constexpr u32 BOOT_TABLE_START = 0x1000;
+constexpr u32 BOOT_TABLE_END = 0x17698;
+constexpr unsigned BOOT_RECORD_COUNT = 17;
+constexpr u32 BOOT_RECORD_HEADER = 8;
+
+ROM_START(ngage_adsp)
+	ROM_REGION(D551_IMAGE_BYTES, "d551", 0)
+	ROM_LOAD("e403a400h450.usb", 0x000000, D551_IMAGE_BYTES, CRC(4f9a8237) SHA1(0fd384d1ae5b54b045ef4c08ed0b4dff6877c8b9))
+ROM_END
+
+} // anonymous namespace
+
+DEFINE_DEVICE_TYPE(NGAGE_ADSP, ngage_adsp_device, "ngage_adsp", "N-Gage D550 (TMS320DA250) Startup Stub")
 
 ngage_adsp_device::ngage_adsp_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
 	: device_t(mconfig, NGAGE_ADSP, tag, owner, clock)
+	, device_memory_interface(mconfig, *this)
+	, m_program_config("program", ENDIANNESS_BIG, 8, 24, 0, address_map_constructor(FUNC(ngage_adsp_device::program_map), this))
+	, m_d551(*this, "d551")
+	, m_boot_ram(*this, "bootram")
 {
+}
+
+tiny_rom_entry const *ngage_adsp_device::device_rom_region() const
+{
+	return ROM_NAME(ngage_adsp);
+}
+
+device_memory_interface::space_config_vector ngage_adsp_device::memory_space_config() const
+{
+	return space_config_vector{ { AS_PROGRAM, &m_program_config } };
+}
+
+void ngage_adsp_device::program_map(address_map &map)
+{
+	map.unmap_value_high();
+	map(0x000000, BOOT_RAM_BYTES - 1).ram().share("bootram");
+	map(D551_BASE, D551_BASE + D551_IMAGE_BYTES - 1).rom().region("d551", 0);
+}
+
+bool ngage_adsp_device::load_boot_ram()
+{
+	struct record
+	{
+		u32 source;
+		u32 address;
+		u32 size;
+	};
+
+	std::array<record, BOOT_RECORD_COUNT> records;
+	u32 cursor = BOOT_TABLE_START;
+	for (unsigned index = 0; index < records.size(); ++index)
+	{
+		if (BOOT_TABLE_END - cursor < BOOT_RECORD_HEADER)
+			return false;
+
+		// This table counts 16-bit words. The program mapping uses bytes.
+		u32 const word_address = get_u32be(&m_d551[cursor]);
+		u32 const words = get_u32be(&m_d551[cursor + 4]);
+		cursor += BOOT_RECORD_HEADER;
+		if (!words || word_address >= BOOT_RAM_BYTES / 2 || words > BOOT_RAM_BYTES / 2 - word_address
+				|| words > (BOOT_TABLE_END - cursor) / 2)
+			return false;
+
+		auto &record = records[index];
+		record = { cursor, word_address * 2, words * 2 };
+		for (unsigned preceding = 0; preceding < index; ++preceding)
+		{
+			auto const &previous = records[preceding];
+			if (record.address < previous.address + previous.size && previous.address < record.address + record.size)
+				return false;
+		}
+		cursor += record.size;
+	}
+	if (cursor != BOOT_TABLE_END || get_u64be(&m_d551[cursor]) != 0xffffffffffffffffULL)
+		return false;
+
+	// Give RAM bytes outside the records a deterministic placeholder value.
+	std::fill_n(m_boot_ram.target(), BOOT_RAM_BYTES, 0);
+	for (auto const &record : records)
+		std::copy_n(&m_d551[record.source], record.size, &m_boot_ram[record.address]);
+	return true;
 }
 
 void ngage_adsp_device::device_start()
 {
 	save_item(NAME(m_enabled));
+	save_item(NAME(m_boot_loaded));
 	save_item(NAME(m_state));
 	save_item(NAME(m_frame));
 	save_item(NAME(m_frame_size));
@@ -41,7 +134,7 @@ void ngage_adsp_device::device_start()
 
 void ngage_adsp_device::device_reset()
 {
-	m_enabled = false;
+	m_enabled = m_boot_loaded = false;
 	reset_link();
 }
 
@@ -62,8 +155,11 @@ void ngage_adsp_device::power_w(bool enabled)
 
 	m_enabled = enabled;
 	reset_link();
-	if (enabled)
+	m_boot_loaded = enabled && load_boot_ram();
+	if (m_boot_loaded)
 		send_startup(false);
+	else if (enabled)
+		logerror("Audio DSP has invalid D551 boot records\n");
 }
 
 u8 ngage_adsp_device::rx_r()
@@ -124,7 +220,7 @@ void ngage_adsp_device::send_startup(bool reset_only)
 
 void ngage_adsp_device::tx_w(u8 data)
 {
-	if (!m_enabled)
+	if (!m_boot_loaded)
 		return;
 
 	if (m_frame_size < 2 && data != 0x55)
@@ -227,7 +323,9 @@ void ngage_adsp_device::handle_frame()
 	// Test 0x42 covers the modeled boot prerequisites. Other tests and
 	// unimplemented gain/control operations return the original error codes.
 	u16 const test = (u16(data[6]) << 8) | data[7];
-	u16 const result = diagnostic ? (test == 0x42 ? 0 : 0x0c) : 2;
+	u16 result = 2;
+	if (diagnostic)
+		result = test == 0x42 && space(AS_PROGRAM).read_word(D551_MARKER_ADDRESS) == D551_MARKER ? 0 : 0x0c;
 	m_reply[0] = data[1];
 	m_reply[1] = data[0];
 	m_reply[2] = data[2];

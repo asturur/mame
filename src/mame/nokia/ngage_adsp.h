@@ -7,7 +7,7 @@
 
 #include <span>
 
-class ngage_adsp_device : public device_t
+class ngage_adsp_device : public device_t, public device_memory_interface
 {
 public:
 	ngage_adsp_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock);
@@ -18,12 +18,16 @@ public:
 	u8 rx_r();
 
 protected:
+	virtual tiny_rom_entry const *device_rom_region() const override ATTR_COLD;
+	virtual space_config_vector memory_space_config() const override;
 	virtual void device_start() override ATTR_COLD;
 	virtual void device_reset() override ATTR_COLD;
 
 private:
 	enum : u8 { WAIT_LINK, READY, WAIT_ACK };
 
+	void program_map(address_map &map) ATTR_COLD;
+	bool load_boot_ram();
 	void reset_link();
 	void handle_frame();
 	void send_frame(u8 resource, std::span<u8 const> payload);
@@ -32,7 +36,12 @@ private:
 	static constexpr unsigned MAX_PAYLOAD = 247;
 	static constexpr unsigned MAX_FRAME = 10 + MAX_PAYLOAD + 1;
 
+	address_space_config const m_program_config;
+	required_region_ptr<u8> m_d551;
+	required_shared_ptr<u8> m_boot_ram;
+
 	bool m_enabled = false;
+	bool m_boot_loaded = false;
 	u8 m_state = WAIT_LINK;
 	u8 m_frame[MAX_FRAME]{};
 	u16 m_frame_size = 0;
