@@ -28,15 +28,7 @@
 
 namespace {
 
-constexpr u32 BOOT_RAM_BYTES = 0x40000;
-constexpr u32 D551_BASE = 0x400000;
 constexpr u32 D551_IMAGE_BYTES = 0x16fc4a;
-constexpr u32 D551_MARKER_ADDRESS = D551_BASE + 0x160000;
-constexpr u16 D551_MARKER = 0xfffc;
-constexpr u32 BOOT_TABLE_START = 0x1000;
-constexpr u32 BOOT_TABLE_END = 0x17698;
-constexpr u32 BOOT_RECORD_COUNT = 17;
-constexpr u32 BOOT_RECORD_HEADER = 8;
 
 ROM_START(ngage_adsp)
 	ROM_REGION(D551_IMAGE_BYTES, "d551", 0)
@@ -79,6 +71,11 @@ void ngage_adsp_device::program_map(address_map &map)
 
 bool ngage_adsp_device::load_boot_ram()
 {
+	constexpr u32 BOOT_TABLE_START = 0x1000;
+	constexpr u32 BOOT_TABLE_END = 0x17698;
+	constexpr u32 BOOT_RECORD_COUNT = 17;
+	constexpr u32 BOOT_RECORD_HEADER = 8;
+
 	struct record
 	{
 		u32 source;
@@ -329,6 +326,8 @@ void ngage_adsp_device::handle_frame()
 
 	// Test 0x42 covers the modeled boot prerequisites. Other tests and
 	// unimplemented gain/control operations return the original error codes.
+	constexpr u32 D551_MARKER_ADDRESS = D551_BASE + 0x160000;
+	constexpr u16 D551_MARKER = 0xfffc;
 	u16 const test = (u16(data[6]) << 8) | data[7];
 	u16 result = 2;
 	if (diagnostic)

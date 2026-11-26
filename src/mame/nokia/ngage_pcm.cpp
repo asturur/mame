@@ -8,25 +8,6 @@
 
 #include <bit>
 
-namespace {
-
-u16 frame_word(std::span<u8 const> packet, u32 offset)
-{
-	return (u16(packet[offset]) << 8) | packet[offset + 1];
-}
-
-bool valid_halves(u32 first, u32 second, u32 bytes, u32 memory_start, u32 memory_end)
-{
-	u64 const first_end = u64(first) + bytes;
-	u64 const second_end = u64(second) + bytes;
-	return bytes && !((first | second) & 1)
-		&& first >= memory_start && first_end <= memory_end
-		&& second >= memory_start && second_end <= memory_end
-		&& (first_end <= second || second_end <= first);
-}
-
-} // anonymous namespace
-
 DEFINE_DEVICE_TYPE(NGAGE_PCM, ngage_pcm_device, "ngage_pcm", "N-Gage UPP DSP PCM")
 
 ngage_pcm_device::ngage_pcm_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
@@ -165,21 +146,36 @@ void ngage_pcm_device::service_reply()
 	}
 }
 
+bool ngage_pcm_device::valid_halves(u32 first, u32 second, u32 bytes) const
+{
+	u64 const first_end = u64(first) + bytes;
+	u64 const second_end = u64(second) + bytes;
+	return bytes && !((first | second) & 1)
+		&& first >= m_memory_start && first_end <= m_memory_end
+		&& second >= m_memory_start && second_end <= m_memory_end
+		&& (first_end <= second || second_end <= first);
+}
+
 void ngage_pcm_device::receive(std::span<u8 const> packet)
 {
 	if (packet.size() < 10)
 		return;
 
+	auto const frame_word = [packet](u32 offset) -> u16
+	{
+		return (u16(packet[offset]) << 8) | packet[offset + 1];
+	};
+
 	u8 const transaction = packet[8];
 	u8 const opcode = packet[9];
 	if (opcode == 0x20 && packet.size() == 24)
 	{
-		u16 const capacity = frame_word(packet, 12);
-		u32 const first = (u32(frame_word(packet, 14)) << 16) | frame_word(packet, 16);
-		u32 const second = (u32(frame_word(packet, 18)) << 16) | frame_word(packet, 20);
+		u16 const capacity = frame_word(12);
+		u32 const first = (u32(frame_word(14)) << 16) | frame_word(16);
+		u32 const second = (u32(frame_word(18)) << 16) | frame_word(20);
 		if (packet[10] != 0x82 || packet[11] != 2 || packet[22]
 			|| (packet[23] != 0x32 && packet[23] != 0x46)
-			|| !valid_halves(first, second, u32(capacity) * 2, m_memory_start, m_memory_end))
+			|| !valid_halves(first, second, u32(capacity) * 2))
 			return;
 
 		stop();
@@ -207,7 +203,7 @@ void ngage_pcm_device::receive(std::span<u8 const> packet)
 		return;
 
 	u8 const half = opcode == 0x23 && packet[10] < 2 ? packet[10] : opcode == 0x27 ? m_requested : NO_HALF;
-	u16 const frames = frame_word(packet, 12);
+	u16 const frames = frame_word(12);
 	if (half == NO_HALF || m_frames[half] || frames > m_capacity || (packet[11] != 1 && packet[11] != 2))
 		return;
 

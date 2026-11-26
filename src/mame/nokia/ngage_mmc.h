@@ -34,6 +34,13 @@ protected:
 	virtual char const *file_extensions() const noexcept override;
 
 private:
+	static constexpr u32 SECTOR_BYTES = 512;
+	static constexpr u32 OUT_OF_RANGE = 1U << 31;
+	static constexpr u32 ADDRESS_ERROR = 1U << 30;
+	static constexpr u32 BLOCK_LEN_ERROR = 1U << 29;
+	static constexpr u32 WRITE_PROTECTED = 1U << 26;
+	static constexpr u32 ILLEGAL_COMMAND = 1U << 22;
+
 	enum : u8 { IDLE, READY, IDENT, STANDBY, TRANSFER, DATA, RECEIVE, INACTIVE };
 	enum : u8 { FIFO_IDLE, FIFO_RX, FIFO_TX };
 	static constexpr u32 DATA_BUSY = 0x004, CMD_BUSY = 0x008, RESP_TIMEOUT = 0x040;

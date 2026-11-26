@@ -22,6 +22,8 @@ protected:
 	virtual void device_reset() override ATTR_COLD;
 
 private:
+	struct test_file;
+	static test_file const *find_file(u16 id);
 	void reply_status(u16 status);
 	void command(u8 length);
 

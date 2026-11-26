@@ -47,82 +47,10 @@
 
 namespace {
 
-constexpr u32 NOR_SIZE = 0x800000;
-constexpr u32 QD_CS0_SIZE = 0x1000000;
-constexpr u32 PMM_SIZE = 0x10000;
-constexpr u32 CDRIVE_SIZE = 0x400000;
-constexpr u32 SDRAM_BASE = 0x0a000000;
-constexpr u32 SDRAM_END = 0x0b000000;
-constexpr u32 UPP_ROM_BASE = 0x0c000000;
 constexpr u32 UPP_ROM_SIZE = 0x1000;
-constexpr u32 UPP_BASE = 0x0c100000;
-constexpr u32 UPP_WORDS = 0x100000 / 4;
-constexpr u32 ARM_SDRAM_CLOCK = 104'000'000;
-constexpr u32 GENERAL_TIMER_CLOCK = 26'000'000;
-constexpr u32 CTSI_FAST_CLOCK = 32'768;
-constexpr u32 CTSI_NOS_CLOCK = 64;
-constexpr u32 CTSI_EVENT_MASK = 0x3680;
-constexpr u32 CTSI_SOFTWARE_EVENTS = 0x3000;
-constexpr u32 KEYPAD_EVENTS = 0x00ee0004;
-constexpr u32 BLUETOOTH_EVENT = 0x00100000;
-constexpr u32 GENIO_ENABLE_MASK = ((KEYPAD_EVENTS | BLUETOOTH_EVENT) >> 16) * 0x10001U;
-constexpr u8 BLUETOOTH_CBUS_DEVICE = 5;
-constexpr u16 UEM_ADC_DEFAULT = 512;
+constexpr u32 CDRIVE_SIZE = 0x400000;
 constexpr ioport_value BATTERY_LEVEL_MASK = 0x70;
 constexpr ioport_value REPAIR_CALENDAR_MIRROR = 0x80;
-// UEM channel 12 samples that produce seven through one bars in NEM-4 4.03.
-constexpr u16 BATTERY_VOLTAGE_ADC[] = { UEM_ADC_DEFAULT, 470, 465, 460, 450, 440, 430 };
-constexpr u32 MDI_RING_WORDS = 250;
-constexpr u32 MDI_TX_POINTERS = 0x3e8 / 4;
-constexpr u32 MDI_RX_POINTERS = 0x3ec / 4;
-constexpr u32 MDI_CONTROL = 0x4b004 / 4;
-constexpr u32 LCD_WIDTH = 176;
-constexpr u32 LCD_HEIGHT = 208;
-constexpr u32 LCD_ROW_PAIRS = LCD_WIDTH / 2;
-constexpr u32 LCD_PAIRS = LCD_ROW_PAIRS * LCD_HEIGHT;
-
-// UPP flash read-side equations from Andrea Bogazzi's ngage_descramble.v.
-u16 descramble_nos(u16 cipher, u32 address)
-{
-	struct equation
-	{
-		u16 cipher_mask;
-		u32 address_mask;
-		u8 a, b, c, d;
-		bool invert;
-	};
-	static constexpr equation equations[] = {
-		{ 0x0101, 0x020102,  4, 10,  8, 17, false },
-		{ 0x0202, 0x000000,  3, 13,  9, 17, false },
-		{ 0x0044, 0x102628,  9, 10,  5, 13, false },
-		{ 0x0108, 0x040008, 11, 12,  5, 14, true  },
-		{ 0x0012, 0x004c84,  7, 11, 10, 14, false },
-		{ 0x8020, 0x240188,  3,  8,  7, 18, true  },
-		{ 0x0840, 0x041042,  6, 12,  4, 15, true  },
-		{ 0x00a0, 0x010802,  2,  5, 11, 16, true  },
-		{ 0x0140, 0x202204,  9, 13,  7, 16, true  },
-		{ 0x2200, 0x088012,  4, 15,  8, 16, false },
-		{ 0x0401, 0x002280,  5, 11,  7, 13, false },
-		{ 0x0800, 0x084980,  0,  0,  0,  0, true  },
-		{ 0x5000, 0x008122,  3,  6,  8, 15, true  },
-		{ 0x2004, 0x001004,  6, 11,  0,  0, true  },
-		{ 0x4400, 0x000006,  4, 15,  6, 16, false },
-		{ 0x8008, 0x100444,  6, 10, 12, 17, false },
-	};
-
-	u16 plain = 0;
-	for (u32 i = 0; i < std::size(equations); ++i)
-	{
-		auto const &eq = equations[i];
-		u32 const parity = std::popcount(u32(cipher & eq.cipher_mask))
-			^ std::popcount(address & eq.address_mask)
-			^ (BIT(address, eq.a) & BIT(address, eq.b))
-			^ (BIT(address, eq.c) & BIT(address, eq.d))
-			^ eq.invert;
-		plain |= (parity & 1) << i;
-	}
-	return plain;
-}
 
 class ngage_state : public driver_device
 {
@@ -130,6 +58,11 @@ public:
 	DECLARE_INPUT_CHANGED_MEMBER(key_changed);
 
 protected:
+	static constexpr u32 NOR_SIZE = 0x800000;
+	static constexpr u32 UPP_WORDS = 0x100000 / 4;
+	static constexpr u32 LCD_WIDTH = 176;
+	static constexpr u32 LCD_HEIGHT = 208;
+
 	struct keypad_levels { u8 rows, columns; u16 genio; };
 
 	ngage_state(machine_config const &mconfig, device_type type, char const *tag,
@@ -183,6 +116,28 @@ protected:
 	bool m_key_gpio30 = false;
 
 private:
+	static constexpr u32 PMM_SIZE = 0x10000;
+	static constexpr u32 SDRAM_BASE = 0x0a000000;
+	static constexpr u32 SDRAM_END = 0x0b000000;
+	static constexpr u32 UPP_ROM_BASE = 0x0c000000;
+	static constexpr u32 UPP_BASE = 0x0c100000;
+	static constexpr u32 ARM_SDRAM_CLOCK = 104'000'000;
+	static constexpr u32 GENERAL_TIMER_CLOCK = 26'000'000;
+	static constexpr u32 CTSI_FAST_CLOCK = 32'768;
+	static constexpr u32 CTSI_NOS_CLOCK = 64;
+	static constexpr u32 CTSI_EVENT_MASK = 0x3680;
+	static constexpr u32 CTSI_SOFTWARE_EVENTS = 0x3000;
+	static constexpr u32 KEYPAD_EVENTS = 0x00ee0004;
+	static constexpr u32 BLUETOOTH_EVENT = 0x00100000;
+	static constexpr u32 GENIO_ENABLE_MASK = ((KEYPAD_EVENTS | BLUETOOTH_EVENT) >> 16) * 0x10001U;
+	static constexpr u8 BLUETOOTH_CBUS_DEVICE = 5;
+	static constexpr u16 UEM_ADC_DEFAULT = 512;
+	static constexpr u32 MDI_RING_WORDS = 250;
+	static constexpr u32 MDI_TX_POINTERS = 0x3e8 / 4;
+	static constexpr u32 MDI_RX_POINTERS = 0x3ec / 4;
+	static constexpr u32 MDI_CONTROL = 0x4b004 / 4;
+
+	static u16 descramble_nos(u16 cipher, u32 address);
 	template <u32 Chip> u8 *flash_storage(u32 addr);
 	template <bool Samsung> u32 cdrive_r(offs_t offset, u32 mem_mask);
 	void finish_cdrive_erase();
@@ -318,6 +273,9 @@ protected:
 	virtual void machine_reset() override ATTR_COLD;
 
 private:
+	static constexpr u32 LCD_ROW_PAIRS = LCD_WIDTH / 2;
+	static constexpr u32 LCD_PAIRS = LCD_ROW_PAIRS * LCD_HEIGHT;
+
 	void nem4_map(address_map &map) ATTR_COLD;
 	virtual keypad_levels keypad_matrix(u8 row_low, u8 column_low) const override;
 	virtual u32 lcd_r(offs_t offset, u32 mem_mask) override;
@@ -359,6 +317,8 @@ public:
 	void qd(machine_config &config) ATTR_COLD;
 
 private:
+	static constexpr u32 QD_CS0_SIZE = 0x1000000;
+
 	void qd_map(address_map &map) ATTR_COLD;
 	virtual keypad_levels keypad_matrix(u8 row_low, u8 column_low) const override;
 	virtual u32 lcd_r(offs_t offset, u32 mem_mask) override;
@@ -369,6 +329,49 @@ private:
 
 	required_device<ngage_qd_lcd_device> m_qd_lcd;
 };
+
+// UPP flash read-side equations from Andrea Bogazzi's ngage_descramble.v.
+u16 ngage_state::descramble_nos(u16 cipher, u32 address)
+{
+	struct equation
+	{
+		u16 cipher_mask;
+		u32 address_mask;
+		u8 a, b, c, d;
+		bool invert;
+	};
+	static constexpr equation equations[] = {
+		{ 0x0101, 0x020102,  4, 10,  8, 17, false },
+		{ 0x0202, 0x000000,  3, 13,  9, 17, false },
+		{ 0x0044, 0x102628,  9, 10,  5, 13, false },
+		{ 0x0108, 0x040008, 11, 12,  5, 14, true  },
+		{ 0x0012, 0x004c84,  7, 11, 10, 14, false },
+		{ 0x8020, 0x240188,  3,  8,  7, 18, true  },
+		{ 0x0840, 0x041042,  6, 12,  4, 15, true  },
+		{ 0x00a0, 0x010802,  2,  5, 11, 16, true  },
+		{ 0x0140, 0x202204,  9, 13,  7, 16, true  },
+		{ 0x2200, 0x088012,  4, 15,  8, 16, false },
+		{ 0x0401, 0x002280,  5, 11,  7, 13, false },
+		{ 0x0800, 0x084980,  0,  0,  0,  0, true  },
+		{ 0x5000, 0x008122,  3,  6,  8, 15, true  },
+		{ 0x2004, 0x001004,  6, 11,  0,  0, true  },
+		{ 0x4400, 0x000006,  4, 15,  6, 16, false },
+		{ 0x8008, 0x100444,  6, 10, 12, 17, false },
+	};
+
+	u16 plain = 0;
+	for (u32 i = 0; i < std::size(equations); ++i)
+	{
+		auto const &eq = equations[i];
+		u32 const parity = std::popcount(u32(cipher & eq.cipher_mask))
+			^ std::popcount(address & eq.address_mask)
+			^ (BIT(address, eq.a) & BIT(address, eq.b))
+			^ (BIT(address, eq.c) & BIT(address, eq.d))
+			^ eq.invert;
+		plain |= (parity & 1) << i;
+	}
+	return plain;
+}
 
 void ngage_state::machine_start()
 {
@@ -925,6 +928,8 @@ void ngage_state::uem_w(u8 reg, u16 data)
 		m_uem_adc_result = UEM_ADC_DEFAULT;
 		if ((data >> 12) == 12)
 		{
+			// UEM channel 12 samples that produce seven through one bars in NEM-4 4.03.
+			constexpr u16 BATTERY_VOLTAGE_ADC[] = { UEM_ADC_DEFAULT, 470, 465, 460, 450, 440, 430 };
 			ioport_field::user_settings battery;
 			m_config->field(BATTERY_LEVEL_MASK)->get_user_settings(battery);
 			u32 const level = (battery.value & BATTERY_LEVEL_MASK) >> 4;

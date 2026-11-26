@@ -12,34 +12,6 @@
 #include <cstring>
 #include <random>
 
-namespace {
-
-constexpr u32 SECTOR_BYTES = 512;
-constexpr u64 MAX_IMAGE_BYTES = 0x40000000;
-constexpr u32 OUT_OF_RANGE = 1U << 31;
-constexpr u32 ADDRESS_ERROR = 1U << 30;
-constexpr u32 BLOCK_LEN_ERROR = 1U << 29;
-constexpr u32 WRITE_PROTECTED = 1U << 26;
-constexpr u32 ILLEGAL_COMMAND = 1U << 22;
-
-void register_field(u8 *bytes, u32 high, u32 low, u32 value)
-{
-	for (u32 bit = low; bit <= high; ++bit)
-		if (BIT(value, bit - low))
-			bytes[(127 - bit) / 8] |= 1U << (bit & 7);
-}
-
-u8 register_crc(u8 const *bytes)
-{
-	u8 crc = 0;
-	for (u32 i = 0; i < 15; ++i)
-		for (int bit = 7; bit >= 0; --bit)
-			crc = ((crc << 1) ^ ((BIT(crc, 6) != BIT(bytes[i], bit)) ? 9 : 0)) & 0x7f;
-	return (crc << 1) | 1;
-}
-
-} // anonymous namespace
-
 DEFINE_DEVICE_TYPE(NGAGE_MMC, ngage_mmc_device, "ngage_mmc", "N-Gage MMC slot")
 
 ngage_mmc_device::ngage_mmc_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
@@ -168,6 +140,24 @@ TIMER_CALLBACK_MEMBER(ngage_mmc_device::notify_media_change)
 
 std::pair<std::error_condition, std::string> ngage_mmc_device::call_load()
 {
+	constexpr u64 MAX_IMAGE_BYTES = 0x40000000;
+
+	auto const register_field = [](u8 *bytes, u32 high, u32 low, u32 value)
+	{
+		for (u32 bit = low; bit <= high; ++bit)
+			if (BIT(value, bit - low))
+				bytes[(127 - bit) / 8] |= 1U << (bit & 7);
+	};
+
+	auto const register_crc = [](u8 const *bytes) -> u8
+	{
+		u8 crc = 0;
+		for (u32 i = 0; i < 15; ++i)
+			for (int bit = 7; bit >= 0; --bit)
+				crc = ((crc << 1) ^ ((BIT(crc, 6) != BIT(bytes[i], bit)) ? 9 : 0)) & 0x7f;
+		return (crc << 1) | 1;
+	};
+
 	u64 const size = length();
 	if (size < 4 * SECTOR_BYTES || size > MAX_IMAGE_BYTES + SECTOR_BYTES || size % SECTOR_BYTES)
 		return { image_error::INVALIDLENGTH, "MMC image must contain whole 512-byte sectors (2 KiB to 1 GiB)" };

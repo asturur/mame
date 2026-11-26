@@ -20,6 +20,10 @@ protected:
 	virtual bool nvram_write(util::write_stream &file) override;
 
 private:
+	static constexpr u32 DAY_SECONDS = 86400;
+	static constexpr u32 COUNTER_PERIOD = 256 * DAY_SECONDS;
+
+	static u32 time_of_day(system_time const &time);
 	void set_counter(u32 value);
 	u32 m_base;
 };

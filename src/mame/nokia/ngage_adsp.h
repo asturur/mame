@@ -26,6 +26,8 @@ protected:
 	virtual void device_reset() override ATTR_COLD;
 
 private:
+	static constexpr u32 BOOT_RAM_BYTES = 0x40000;
+	static constexpr u32 D551_BASE = 0x400000;
 	enum : u8 { WAIT_LINK, READY, WAIT_ACK };
 
 	void program_map(address_map &map) ATTR_COLD;

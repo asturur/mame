@@ -36,86 +36,6 @@
 #include <algorithm>
 #include <iterator>
 
-namespace {
-
-constexpr u8 BT_REG_DATA = 0x00;
-constexpr u8 BT_REG_RXLEN = 0x01;
-constexpr u8 BT_REG_STATUS = 0x06;
-constexpr u8 BT_REG_REG0 = 0x08;
-constexpr u8 BT_REG_REASON = 0x09;
-constexpr u8 BT_REG_START = 0x0a;
-
-constexpr u16 BT_ST_AWAKE = 0x0004;
-constexpr u16 BT_ST_RX = 0x0010;
-constexpr u16 BT_ST_ACK = 0x0040;
-constexpr u16 BT_ST_RESET = 0x0080;
-
-constexpr u16 BT_REASON_HOST = 0x0008;
-constexpr u32 BT_BUF_SIZE = 520; // the driver's largest write
-constexpr u32 BT_NAME_LEN = 248;
-constexpr u32 BT_NPAR = 16;
-
-/* HCI status codes used here. */
-constexpr u8 BT_OK = 0x00;
-constexpr u8 BT_UNKNOWN_CMD = 0x01;
-constexpr u8 BT_DISALLOWED = 0x0c;
-constexpr u8 BT_BAD_PARAMS = 0x12;
-
-/* What the module holds for the phone (rx_kind) and where a command's
- * return values come from (rep_src). */
-enum : u8 { BT_RX_NONE, BT_RX_REPLY, BT_RX_INQ };
-enum : u8 { BT_SRC_NONE, BT_SRC_FIX, BT_SRC_PAR, BT_SRC_NAME };
-
-/*
- * The values a command reads back before the phone has written them: the
- * defaults of the Bluetooth 1.1 specification. {read OCF, bytes, default},
- * all in OGF 3; the write command is the next OCF.
- */
-struct bt_parameter { u8 ocf, n, def[4]; };
-constexpr bt_parameter BT_PARAMETERS[BT_NPAR] = {
-	{ 0x09, 1, { 0x00 } },                      /* PIN type: variable */
-	{ 0x15, 2, { 0xa0, 0x1f } },                /* connection accept timeout: 5.06 s */
-	{ 0x17, 2, { 0x00, 0x20 } },                /* page timeout: 5.12 s */
-	{ 0x19, 1, { 0x00 } },                      /* scan enable: none */
-	{ 0x1b, 4, { 0x00, 0x08, 0x12, 0x00 } },    /* page scan interval 1.28 s, window 11.25 ms */
-	{ 0x1d, 4, { 0x00, 0x08, 0x12, 0x00 } },    /* inquiry scan, the same */
-	{ 0x1f, 1, { 0x00 } },                      /* authentication: off */
-	{ 0x21, 1, { 0x00 } },                      /* encryption: off */
-	{ 0x23, 3, { 0x00, 0x00, 0x00 } },          /* class of device */
-	{ 0x25, 2, { 0x60, 0x00 } },                /* voice setting */
-	{ 0x29, 1, { 0x01 } },                      /* broadcast retransmissions */
-	{ 0x2b, 1, { 0x00 } },                      /* hold mode activity */
-	{ 0x2e, 1, { 0x00 } },                      /* SCO flow control: off */
-	{ 0x39, 4, { 0x01, 0x33, 0x8b, 0x9e } },    /* one inquiry access code, the general one */
-	{ 0x3b, 1, { 0x00 } },                      /* page scan period mode P0 */
-	{ 0x3d, 1, { 0x00 } },                      /* page scan mode: mandatory */
-};
-constexpr u32 BT_PAR_IAC = 13;
-
-// Commands that complete at once with fixed values.
-struct bt_reply { u16 op; u8 n, ret[8]; };
-constexpr bt_reply BT_FIXED_REPLIES[] = {
-	{ 0x0c0d, 4, { 0x00, 0x00, 0x00, 0x00 } },  /* Read_Stored_Link_Key: room for none, none read */
-	{ 0x0c11, 1, { 0x00 } },                    /* Write_Stored_Link_Key: none written */
-	{ 0x0c12, 2, { 0x00, 0x00 } },              /* Delete_Stored_Link_Key: none deleted */
-	{ 0x0c38, 1, { 0x01 } },                    /* Read_Number_Of_Supported_IAC */
-	/* Read_Local_Version_Information: HCI 1.1, revision 0, LMP 1.1,
-	 * manufacturer 1 (Nokia Mobile Phones), subversion 0 */
-	{ 0x1001, 8, { 0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00 } },
-	/* Read_Local_Supported_Features: all of 1.1's */
-	{ 0x1003, 8, { 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00 } },
-	/* Read_Buffer_Size: ACL 339 bytes x 8, SCO 64 bytes x 8 */
-	{ 0x1005, 7, { 0x53, 0x01, 0x40, 0x08, 0x00, 0x08, 0x00 } },
-	{ 0x1007, 1, { 0x00 } },                    /* Read_Country_Code */
-	{ 0x1009, 6, { 0x00, 0x00, 0x00, 0x57, 0x60, 0x00 } },  /* Read_BD_ADDR: 00:60:57:00:00:00 */
-	/* nothing to return: Set_Event_Mask, Set_Event_Filter, Create_New_Unit_Key,
-	 * Set_Host_Controller_To_Host_Flow_Control, Host_Buffer_Size */
-	{ 0x0c01, 0, { 0 } }, { 0x0c05, 0, { 0 } }, { 0x0c0b, 0, { 0 } },
-	{ 0x0c31, 0, { 0 } }, { 0x0c33, 0, { 0 } },
-};
-
-} // anonymous namespace
-
 /*
  * The state is what the core's copy keeps, register for register, so that
  * the two can be compared after every access: the module does not buffer
@@ -126,6 +46,82 @@ constexpr bt_reply BT_FIXED_REPLIES[] = {
  */
 struct ngage_bt_device::chip_state
 {
+	static constexpr u8 BT_REG_DATA = 0x00;
+	static constexpr u8 BT_REG_RXLEN = 0x01;
+	static constexpr u8 BT_REG_STATUS = 0x06;
+	static constexpr u8 BT_REG_REG0 = 0x08;
+	static constexpr u8 BT_REG_REASON = 0x09;
+	static constexpr u8 BT_REG_START = 0x0a;
+
+	static constexpr u16 BT_ST_AWAKE = 0x0004;
+	static constexpr u16 BT_ST_RX = 0x0010;
+	static constexpr u16 BT_ST_ACK = 0x0040;
+	static constexpr u16 BT_ST_RESET = 0x0080;
+
+	static constexpr u16 BT_REASON_HOST = 0x0008;
+	static constexpr u32 BT_BUF_SIZE = 520; // the driver's largest write
+	static constexpr u32 BT_NAME_LEN = 248;
+	static constexpr u32 BT_NPAR = 16;
+
+	/* HCI status codes used here. */
+	static constexpr u8 BT_OK = 0x00;
+	static constexpr u8 BT_UNKNOWN_CMD = 0x01;
+	static constexpr u8 BT_DISALLOWED = 0x0c;
+	static constexpr u8 BT_BAD_PARAMS = 0x12;
+
+	/* What the module holds for the phone (rx_kind) and where a command's
+	 * return values come from (rep_src). */
+	enum : u8 { BT_RX_NONE, BT_RX_REPLY, BT_RX_INQ };
+	enum : u8 { BT_SRC_NONE, BT_SRC_FIX, BT_SRC_PAR, BT_SRC_NAME };
+
+	/*
+	 * The values a command reads back before the phone has written them: the
+	 * defaults of the Bluetooth 1.1 specification. {read OCF, bytes, default},
+	 * all in OGF 3; the write command is the next OCF.
+	 */
+	struct bt_parameter { u8 ocf, n, def[4]; };
+	static constexpr bt_parameter BT_PARAMETERS[BT_NPAR] = {
+		{ 0x09, 1, { 0x00 } },                      /* PIN type: variable */
+		{ 0x15, 2, { 0xa0, 0x1f } },                /* connection accept timeout: 5.06 s */
+		{ 0x17, 2, { 0x00, 0x20 } },                /* page timeout: 5.12 s */
+		{ 0x19, 1, { 0x00 } },                      /* scan enable: none */
+		{ 0x1b, 4, { 0x00, 0x08, 0x12, 0x00 } },    /* page scan interval 1.28 s, window 11.25 ms */
+		{ 0x1d, 4, { 0x00, 0x08, 0x12, 0x00 } },    /* inquiry scan, the same */
+		{ 0x1f, 1, { 0x00 } },                      /* authentication: off */
+		{ 0x21, 1, { 0x00 } },                      /* encryption: off */
+		{ 0x23, 3, { 0x00, 0x00, 0x00 } },          /* class of device */
+		{ 0x25, 2, { 0x60, 0x00 } },                /* voice setting */
+		{ 0x29, 1, { 0x01 } },                      /* broadcast retransmissions */
+		{ 0x2b, 1, { 0x00 } },                      /* hold mode activity */
+		{ 0x2e, 1, { 0x00 } },                      /* SCO flow control: off */
+		{ 0x39, 4, { 0x01, 0x33, 0x8b, 0x9e } },    /* one inquiry access code, the general one */
+		{ 0x3b, 1, { 0x00 } },                      /* page scan period mode P0 */
+		{ 0x3d, 1, { 0x00 } },                      /* page scan mode: mandatory */
+	};
+	static constexpr u32 BT_PAR_IAC = 13;
+
+	// Commands that complete at once with fixed values.
+	struct bt_reply { u16 op; u8 n, ret[8]; };
+	static constexpr bt_reply BT_FIXED_REPLIES[] = {
+		{ 0x0c0d, 4, { 0x00, 0x00, 0x00, 0x00 } },  /* Read_Stored_Link_Key: room for none, none read */
+		{ 0x0c11, 1, { 0x00 } },                    /* Write_Stored_Link_Key: none written */
+		{ 0x0c12, 2, { 0x00, 0x00 } },              /* Delete_Stored_Link_Key: none deleted */
+		{ 0x0c38, 1, { 0x01 } },                    /* Read_Number_Of_Supported_IAC */
+		/* Read_Local_Version_Information: HCI 1.1, revision 0, LMP 1.1,
+		 * manufacturer 1 (Nokia Mobile Phones), subversion 0 */
+		{ 0x1001, 8, { 0x01, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00 } },
+		/* Read_Local_Supported_Features: all of 1.1's */
+		{ 0x1003, 8, { 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00 } },
+		/* Read_Buffer_Size: ACL 339 bytes x 8, SCO 64 bytes x 8 */
+		{ 0x1005, 7, { 0x53, 0x01, 0x40, 0x08, 0x00, 0x08, 0x00 } },
+		{ 0x1007, 1, { 0x00 } },                    /* Read_Country_Code */
+		{ 0x1009, 6, { 0x00, 0x00, 0x00, 0x57, 0x60, 0x00 } },  /* Read_BD_ADDR: 00:60:57:00:00:00 */
+		/* nothing to return: Set_Event_Mask, Set_Event_Filter, Create_New_Unit_Key,
+		 * Set_Host_Controller_To_Host_Flow_Control, Host_Buffer_Size */
+		{ 0x0c01, 0, { 0 } }, { 0x0c05, 0, { 0 } }, { 0x0c0b, 0, { 0 } },
+		{ 0x0c31, 0, { 0 } }, { 0x0c33, 0, { 0 } },
+	};
+
 	void event(u16 bit);
 	void begin_reset();
 	void finish_reset();

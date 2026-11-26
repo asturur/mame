@@ -13,18 +13,6 @@
 #include <ctime>
 #include <string_view>
 
-namespace {
-
-constexpr u32 DAY_SECONDS = 86400;
-constexpr u32 COUNTER_PERIOD = 256 * DAY_SECONDS;
-
-u32 time_of_day(system_time const &time)
-{
-	return time.local_time.hour * 3600 + time.local_time.minute * 60 + time.local_time.second;
-}
-
-} // anonymous namespace
-
 DEFINE_DEVICE_TYPE(NGAGE_RTC, ngage_rtc_device, "ngage_rtc", "N-Gage UEM RTC")
 
 ngage_rtc_device::ngage_rtc_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
@@ -36,6 +24,11 @@ ngage_rtc_device::ngage_rtc_device(machine_config const &mconfig, char const *ta
 void ngage_rtc_device::device_start()
 {
 	save_item(NAME(m_base));
+}
+
+u32 ngage_rtc_device::time_of_day(system_time const &time)
+{
+	return time.local_time.hour * 3600 + time.local_time.minute * 60 + time.local_time.second;
 }
 
 u32 ngage_rtc_device::counter() const

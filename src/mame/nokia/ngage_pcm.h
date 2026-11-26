@@ -29,6 +29,7 @@ private:
 	static constexpr u32 STREAM_RATE = 16'000;
 	static constexpr u8 NO_HALF = 2;
 	void set_route(std::span<u8 const> packet);
+	bool valid_halves(u32 first, u32 second, u32 bytes) const;
 	void make_reply(u8 transaction, u8 opcode, u16 value = 0);
 	void service_reply();
 	void start_half(u8 preferred);
