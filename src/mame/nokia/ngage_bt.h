@@ -1,5 +1,5 @@
-// license:GPL-2.0+
-// copyright-holders:Andrea Bogazzi
+// license:BSD-3-Clause
+// copyright-holders:Andrea Bogazzi, Jacob Jewell
 #ifndef MAME_NOKIA_NGAGE_BT_H
 #define MAME_NOKIA_NGAGE_BT_H
 

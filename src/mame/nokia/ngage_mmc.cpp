@@ -1,4 +1,4 @@
-// license:GPL-2.0+
+// license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
 // N-Gage UPP native MMC host and byte-addressed card at transaction level.
 // The card image supplies the sectors and optionally the original CID/CSD/OCR.

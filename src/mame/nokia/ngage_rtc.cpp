@@ -1,4 +1,4 @@
-// license:GPL-2.0+
+// license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
 // Battery-backed UEM counter. The absolute calendar base belongs to NOS PMM.
 

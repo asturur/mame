@@ -1,4 +1,4 @@
-// license:GPL-2.0+
+// license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
 // The internal UPP DSP owns the E8 PCM resource. The original NOS audio
 // driver submits signed mono samples in two SDRAM halves via its MDI ring.

@@ -1,5 +1,5 @@
-// license:GPL-2.0+
-// copyright-holders:Andrea Bogazzi
+// license:BSD-3-Clause
+// copyright-holders:Andrea Bogazzi, Jacob Jewell
 /***************************************************************************
 
     Nokia N-Gage (NEM-4) and N-Gage QD (RH-29)

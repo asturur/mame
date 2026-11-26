@@ -1,4 +1,4 @@
-// license:GPL-2.0+
+// license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
 /*
     NEM-4 D550 (TMS320DA250GHH-144) audio DSP startup stub.

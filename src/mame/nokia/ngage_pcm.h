@@ -1,4 +1,4 @@
-// license:GPL-2.0+
+// license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
 #ifndef MAME_NOKIA_NGAGE_PCM_H
 #define MAME_NOKIA_NGAGE_PCM_H

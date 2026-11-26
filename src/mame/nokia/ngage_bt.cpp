@@ -1,5 +1,5 @@
-// license:GPL-2.0+
-// copyright-holders:Andrea Bogazzi, the NGage_MiSTer authors
+// license:BSD-3-Clause
+// copyright-holders:Andrea Bogazzi, Jacob Jewell, the NGage_MiSTer authors
 /*
  * CBUS Bluetooth controller from the N-Gage QD study's Bluetooth 1.1 model.
  * See the NGage_MiSTer Bluetooth notes for the firmware traces.

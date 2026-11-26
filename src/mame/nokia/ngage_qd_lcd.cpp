@@ -1,7 +1,7 @@
-// license:GPL-2.0+
-// copyright-holders:Andrea Bogazzi, the NGage_MiSTer authors
+// license:BSD-3-Clause
+// copyright-holders:Andrea Bogazzi, Jacob Jewell, the NGage_MiSTer authors
 /*
-    N-Gage QD LCD, based on ngage2 model/hw/ngage_lcd.c (GPL-2.0-or-later).
+    N-Gage QD LCD, adapted from ngage2 model/hw/ngage_lcd.c.
     The UPP transfer phases carry DCS commands, parameters and packed pixels.
     The modeled 0x29 ID selects the QD driver's module 0x10 path.
 */

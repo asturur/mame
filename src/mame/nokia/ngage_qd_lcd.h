@@ -1,5 +1,5 @@
-// license:GPL-2.0+
-// copyright-holders:Andrea Bogazzi, the NGage_MiSTer authors
+// license:BSD-3-Clause
+// copyright-holders:Andrea Bogazzi, Jacob Jewell, the NGage_MiSTer authors
 #ifndef MAME_NOKIA_NGAGE_QD_LCD_H
 #define MAME_NOKIA_NGAGE_QD_LCD_H
 
