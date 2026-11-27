@@ -7,44 +7,19 @@
 #include "multibyte.h"
 
 #include <algorithm>
-#include <cstring>
-#include <random>
 
 DEFINE_DEVICE_TYPE(NGAGE_MMC, ngage_mmc_device, "ngage_mmc", "N-Gage MMC slot")
 
 ngage_mmc_device::ngage_mmc_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
-	: device_t(mconfig, NGAGE_MMC, tag, owner, clock)
-	, device_image_interface(mconfig, *this)
+	: mmc_card_device(mconfig, NGAGE_MMC, tag, owner, clock)
 	, m_event_cb(*this)
 	, m_media_change_cb(*this)
 	, m_command_timer(nullptr)
+	, m_tail_timer(nullptr)
 	, m_hot_swap(false)
-	, m_mount_id(0)
-	, m_saved_mount_id(0)
-	, m_payload_size(0)
-	, m_card_capacity(0)
-	, m_cid{}
-	, m_csd{}
-	, m_ocr(0)
-	, m_write_protected(false)
 	, m_response{}
 	, m_fifo{}
 {
-}
-
-bool ngage_mmc_device::is_readable() const noexcept
-{
-	return true;
-}
-
-bool ngage_mmc_device::is_writeable() const noexcept
-{
-	return true;
-}
-
-bool ngage_mmc_device::is_creatable() const noexcept
-{
-	return false;
 }
 
 bool ngage_mmc_device::is_reset_on_load() const noexcept
@@ -52,26 +27,11 @@ bool ngage_mmc_device::is_reset_on_load() const noexcept
 	return !m_hot_swap;
 }
 
-char const *ngage_mmc_device::image_type_name() const noexcept
-{
-	return "mmccard";
-}
-
-char const *ngage_mmc_device::image_brief_type_name() const noexcept
-{
-	return "mmc";
-}
-
-char const *ngage_mmc_device::file_extensions() const noexcept
-{
-	return "mmc,img,bin";
-}
-
 void ngage_mmc_device::device_start()
 {
+	mmc_card_device::device_start();
 	m_command_timer = timer_alloc(FUNC(ngage_mmc_device::command_complete), this);
 	m_tail_timer = timer_alloc(FUNC(ngage_mmc_device::command_tail), this);
-	save_item(NAME(m_saved_mount_id));
 	save_item(NAME(m_reg));
 	save_item(NAME(m_status));
 	save_item(NAME(m_type));
@@ -80,11 +40,6 @@ void ngage_mmc_device::device_start()
 	save_item(NAME(m_response));
 	save_item(NAME(m_response_words));
 	save_item(NAME(m_response_pos));
-	save_item(NAME(m_card_state));
-	save_item(NAME(m_rca));
-	save_item(NAME(m_block_length));
-	save_item(NAME(m_multiblock));
-	save_item(NAME(m_next_address));
 	save_item(NAME(m_fifo_direction));
 	save_item(NAME(m_fifo));
 	save_item(NAME(m_fifo_length));
@@ -93,30 +48,25 @@ void ngage_mmc_device::device_start()
 
 void ngage_mmc_device::device_reset()
 {
+	mmc_card_device::device_reset();
 	std::fill(std::begin(m_reg), std::end(m_reg), 0);
-	reset_card();
+	reset_host();
 }
 
 void ngage_mmc_device::device_post_load()
 {
-	if (m_saved_mount_id != m_mount_id)
+	if (!revalidate_media())
 	{
 		abort_card_transfer();
-		m_saved_mount_id = m_mount_id;
 		machine().scheduler().synchronize(timer_expired_delegate(FUNC(ngage_mmc_device::notify_media_change), this));
 	}
 }
 
-void ngage_mmc_device::reset_card()
+void ngage_mmc_device::reset_host()
 {
 	m_status = 0;
 	m_type = m_command = m_argument = 0;
 	m_response_words = m_response_pos = 0;
-	m_card_state = IDLE;
-	m_rca = 1;
-	m_block_length = SECTOR_BYTES;
-	m_multiblock = false;
-	m_next_address = 0;
 	m_fifo_direction = FIFO_IDLE;
 	m_fifo_length = m_fifo_pos = 0;
 	m_command_timer->enable(false);
@@ -127,7 +77,7 @@ void ngage_mmc_device::abort_card_transfer()
 {
 	u32 const status = ((m_status & CMD_BUSY) && m_type ? RESP_TIMEOUT : 0)
 		| (m_status & DATA_BUSY ? DATA_TIMEOUT : 0);
-	reset_card();
+	reset_host();
 	m_status = status;
 }
 
@@ -136,111 +86,15 @@ TIMER_CALLBACK_MEMBER(ngage_mmc_device::notify_media_change)
 	m_media_change_cb(1);
 }
 
-std::pair<std::error_condition, std::string> ngage_mmc_device::call_load()
+void ngage_mmc_device::media_unloaded()
 {
-	constexpr u64 MAX_IMAGE_BYTES = 0x40000000;
-
-	auto const register_field = [](u8 *bytes, u32 high, u32 low, u32 value)
-	{
-		for (u32 bit = low; bit <= high; ++bit)
-			if (BIT(value, bit - low))
-				bytes[(127 - bit) / 8] |= 1U << (bit & 7);
-	};
-
-	auto const register_crc = [](u8 const *bytes) -> u8
-	{
-		u8 crc = 0;
-		for (u32 i = 0; i < 15; ++i)
-			for (int bit = 7; bit >= 0; --bit)
-				crc = ((crc << 1) ^ ((BIT(crc, 6) != BIT(bytes[i], bit)) ? 9 : 0)) & 0x7f;
-		return (crc << 1) | 1;
-	};
-
-	u64 const size = length();
-	if (size < 4 * SECTOR_BYTES || size > MAX_IMAGE_BYTES + SECTOR_BYTES || size % SECTOR_BYTES)
-		return { image_error::INVALIDLENGTH, "MMC image must contain whole 512-byte sectors (2 KiB to 1 GiB)" };
-
-	u8 footer[SECTOR_BYTES];
-	if (fseek(size - SECTOR_BYTES, SEEK_SET) || fread(footer, sizeof(footer)) != sizeof(footer))
-		return { image_error::INVALIDIMAGE, "Could not read the last MMC sector" };
-
-	u64 payload = size;
-	u32 ocr = 0x00ff8000;
-	u8 cid[16] = { 0, 0, 0, 'M', 'A', 'M', 'E', 'M', 'C', 0x10, 0, 0, 0, 1, 0xa8, 0 };
-	u8 csd[16]{};
-	bool const has_footer = !std::memcmp(footer, "NGAGEMMC", 8);
-	if (has_footer)
-	{
-		if (footer[8] != 1)
-			return { image_error::UNSUPPORTED, "Unsupported NGAGEMMC footer version" };
-		payload -= SECTOR_BYTES;
-		std::copy_n(&footer[16], 16, cid);
-		std::copy_n(&footer[32], 16, csd);
-		ocr = get_u32be(&footer[48]);
-		if ((csd[0] >> 6) != 2 || (csd[5] & 15) != 9 || (ocr & 0x60000000))
-			return { image_error::UNSUPPORTED, "Expected a byte-addressed MMC with 512-byte sectors" };
-	}
-	else
-	{
-		if (payload > MAX_IMAGE_BYTES)
-			return { image_error::INVALIDLENGTH, "Raw MMC image exceeds 1 GiB" };
-		u32 const sectors = payload / SECTOR_BYTES;
-		u32 mult = 0;
-		while (sectors > (4096U << (mult + 2)))
-			++mult;
-		u32 const sectors_per_unit = 1U << (mult + 2);
-		if (sectors % sectors_per_unit)
-			return { image_error::INVALIDLENGTH, "Raw MMC image size cannot be represented by a byte-addressed card" };
-		u32 const count = sectors / sectors_per_unit;
-		register_field(csd, 127, 126, 2);
-		register_field(csd, 125, 122, 3);
-		register_field(csd, 119, 112, 0x0f);
-		register_field(csd, 103, 96, 0x2a);
-		register_field(csd, 95, 84, 0x015);
-		register_field(csd, 83, 80, 9);
-		register_field(csd, 79, 79, 1);
-		register_field(csd, 77, 77, 1);
-		register_field(csd, 73, 62, count - 1);
-		register_field(csd, 61, 50, 0xdb6);
-		register_field(csd, 49, 47, mult);
-		register_field(csd, 41, 37, 15);
-		register_field(csd, 28, 26, 2);
-		register_field(csd, 25, 22, 9);
-	}
-
-	u32 const c_size = ((csd[6] & 3) << 10) | (csd[7] << 2) | (csd[8] >> 6);
-	u32 const mult = ((csd[9] & 3) << 1) | (csd[10] >> 7);
-	u64 const capacity = u64(c_size + 1) << (mult + 11);
-	if (payload > capacity)
-		return { image_error::INVALIDLENGTH, "MMC payload is larger than the footer's CSD capacity" };
-
-	std::random_device random;
-	u64 const high = u64(random()) << 32;
-	m_saved_mount_id = m_mount_id = (high | random()) | 1;
-	m_payload_size = payload;
-	m_card_capacity = capacity;
-	m_ocr = ocr & 0x7fffffff;
-	m_write_protected = is_readonly() || (csd[14] & 0x30) || payload < capacity;
-	if (m_write_protected)
-		csd[14] |= 0x10;
-	cid[15] = register_crc(cid);
-	csd[15] = register_crc(csd);
-	std::copy_n(cid, 16, m_cid);
-	std::copy_n(csd, 16, m_csd);
-	return { };
-}
-
-void ngage_mmc_device::call_unload()
-{
-	m_saved_mount_id = m_mount_id = 0;
-	m_payload_size = 0;
 	bool const running = machine().phase() == machine_phase::RUNNING;
 	if (m_hot_swap && running)
 		abort_card_transfer();
 	else if (m_command_timer)
 	{
 		std::fill(std::begin(m_reg), std::end(m_reg), 0);
-		reset_card();
+		reset_host();
 	}
 	if (running)
 		m_media_change_cb(1);
@@ -309,7 +163,7 @@ void ngage_mmc_device::start(u32 control)
 
 TIMER_CALLBACK_MEMBER(ngage_mmc_device::command_complete)
 {
-	card_command();
+	complete_card_command();
 	if (m_response_words != 4)
 		m_tail_timer->adjust(clocks_to_attotime(8));
 	m_event_cb(1);
@@ -357,169 +211,69 @@ u32 ngage_mmc_device::response_r()
 	return data;
 }
 
-bool ngage_mmc_device::in_range(u64 offset, u32 length) const
+void ngage_mmc_device::complete_card_command()
 {
-	u64 const limit = std::min(m_card_capacity, m_payload_size);
-	return offset <= limit && length <= limit - offset;
-}
-
-void ngage_mmc_device::card_command()
-{
-	if (!mounted())
+	auto const reply = card_command(m_command, m_argument);
+	switch (reply.type)
 	{
+	case reply_type::none:
+		break;
+	case reply_type::short_response:
+		response(reply.value);
+		break;
+	case reply_type::long_response:
+		response(reply.register_data);
+		break;
+	case reply_type::timeout:
+		if (m_type)
+			m_status |= RESP_TIMEOUT;
+		break;
+	case reply_type::no_media:
 		if (m_type)
 			m_status |= RESP_TIMEOUT;
 		m_status &= ~DATA_BUSY;
-		return;
-	}
-
-	u32 const r1 = (u32(m_card_state) << 9) | 0x100;
-	bool const addressed = u16(m_argument >> 16) == m_rca;
-	switch (m_command)
-	{
-	case 0:
-		m_card_state = IDLE;
-		m_rca = 1;
-		m_block_length = SECTOR_BYTES;
-		m_multiblock = false;
-		return;
-	case 1:
-		if (m_card_state == IDLE)
-		{
-			response(m_ocr | 0x80000000);
-			if (m_argument)
-				m_card_state = READY;
-			return;
-		}
 		break;
-	case 2:
-		if (m_card_state == READY)
-		{
-			response(m_cid);
-			m_card_state = IDENT;
-			return;
-		}
-		break;
-	case 3:
-		if (m_card_state == IDENT)
-		{
-			response(r1);
-			m_rca = m_argument >> 16;
-			m_card_state = STANDBY;
-			return;
-		}
-		break;
-	case 7:
-		if (addressed && (m_card_state == STANDBY || m_card_state == TRANSFER))
-		{
-			response(r1);
-			m_card_state = TRANSFER;
-		}
+	case reply_type::illegal:
+		if (m_type == 3)
+			m_status |= RESP_TIMEOUT;
 		else
-		{
-			if (m_card_state >= TRANSFER)
-				m_card_state = STANDBY;
-			if (m_type)
-				m_status |= RESP_TIMEOUT;
-		}
-		return;
-	case 9:
-	case 10:
-		if (addressed && m_card_state == STANDBY)
-		{
-			response(m_command == 9 ? m_csd : m_cid);
-			return;
-		}
-		break;
-	case 12:
-		if (m_card_state == DATA || m_card_state == RECEIVE || m_card_state == TRANSFER)
-		{
-			response(r1);
-			m_card_state = TRANSFER;
-			m_multiblock = false;
-			return;
-		}
-		break;
-	case 13:
-		if (addressed && m_card_state >= STANDBY && m_card_state != INACTIVE)
-			response(r1);
-		else if (m_type)
-			m_status |= RESP_TIMEOUT; // QD polls cards before assigning an address.
-		return;
-	case 15:
-		if (addressed)
-			m_card_state = INACTIVE;
-		return;
-	case 16:
-		if (m_card_state == TRANSFER)
-		{
-			if (m_argument && m_argument <= SECTOR_BYTES && (BIT(m_csd[6], 7) || m_argument == SECTOR_BYTES))
-			{
-				m_block_length = m_argument;
-				response(r1);
-			}
-			else
-				response(r1 | BLOCK_LEN_ERROR);
-			return;
-		}
-		break;
-	case 17: case 18: case 24: case 25:
-	{
-		bool const write = m_command >= 24;
-		u32 const card_class = write ? 4 : 2;
-		u32 const classes = (m_csd[4] << 4) | (m_csd[5] >> 4);
-		if (m_card_state != TRANSFER || !BIT(classes, card_class))
-			break;
-
-		u32 error = 0;
-		if (write && m_write_protected)
-			error = WRITE_PROTECTED;
-		else if (write && m_block_length != SECTOR_BYTES)
-			error = BLOCK_LEN_ERROR;
-		else if ((write || !BIT(m_csd[6], 5)) && m_argument % m_block_length)
-			error = ADDRESS_ERROR;
-		else if (!in_range(m_argument, m_block_length))
-			error = OUT_OF_RANGE;
-		response(r1 | error);
-		if (error)
-		{
-			m_status = (m_status & ~DATA_BUSY) | DATA_TIMEOUT;
-			return;
-		}
-		m_card_state = write ? RECEIVE : DATA;
-		m_next_address = m_argument;
-		m_multiblock = m_command == 18 || m_command == 25;
+			response(reply.value);
 		if (m_status & DATA_BUSY)
-			begin_data(write);
-		return;
-	}
-	default:
+			m_status = (m_status & ~DATA_BUSY) | DATA_TIMEOUT;
 		break;
 	}
-	if (m_type == 3)
-		m_status |= RESP_TIMEOUT;
-	else
-		response(r1 | ILLEGAL_COMMAND);
-	if (m_status & DATA_BUSY)
+
+	switch (reply.transfer)
+	{
+	case transfer_type::none:
+		break;
+	case transfer_type::read:
+	case transfer_type::write:
+		if (m_status & DATA_BUSY)
+			begin_data(reply.transfer == transfer_type::write);
+		break;
+	case transfer_type::error:
 		m_status = (m_status & ~DATA_BUSY) | DATA_TIMEOUT;
+		break;
+	}
 }
 
 void ngage_mmc_device::begin_data(bool write)
 {
 	u32 const programmed = m_reg[0x08 / 4];
-	u32 const size = programmed ? std::min<u32>(programmed, sizeof(m_fifo)) : m_block_length;
-	if (m_card_state != (write ? RECEIVE : DATA) || !is_open() || !in_range(m_next_address, size)
-			|| (!m_multiblock && size > m_block_length) || (write && size % SECTOR_BYTES))
+	u32 const size = programmed ? std::min<u32>(programmed, sizeof(m_fifo)) : block_length();
+	switch (begin_transfer(write, m_fifo, size))
 	{
+	case data_result::timeout:
 		m_status |= DATA_TIMEOUT;
 		end_data();
 		return;
-	}
-	if (!write && (fseek(m_next_address, SEEK_SET) || fread(m_fifo, size) != size))
-	{
+	case data_result::io_error:
 		m_status |= DATA_ERROR;
 		end_data();
 		return;
+	case data_result::ok:
+		break;
 	}
 	m_fifo_length = size;
 	m_fifo_pos = 0;
@@ -528,16 +282,10 @@ void ngage_mmc_device::begin_data(bool write)
 
 void ngage_mmc_device::end_data()
 {
-	if (m_fifo_direction == FIFO_TX
-			&& (!mounted() || !is_open() || m_saved_mount_id != m_mount_id || m_write_protected
-				|| !in_range(m_next_address, m_fifo_length) || fseek(m_next_address, SEEK_SET)
-				|| fwrite(m_fifo, m_fifo_length) != m_fifo_length))
+	if (!finish_transfer(m_fifo_direction == FIFO_TX, m_fifo, m_fifo_length))
 		m_status |= DATA_ERROR;
-	m_next_address += m_fifo_length;
 	m_fifo_direction = FIFO_IDLE;
 	m_status &= ~DATA_BUSY;
-	if (!m_multiblock && (m_card_state == RECEIVE || m_card_state == DATA))
-		m_card_state = TRANSFER;
 	if (m_type == 7 || m_type == 10)
 		m_command_timer->adjust(clocks_to_attotime(96));
 	m_event_cb(1);
