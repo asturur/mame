@@ -1,7 +1,6 @@
 // license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
-// The internal UPP DSP owns the E8 PCM resource. The original NOS audio
-// driver submits signed mono samples in two SDRAM halves via its MDI ring.
+// NOS submits E8 mono PCM in two SDRAM halves via MDI.
 
 #include "emu.h"
 #include "ngage_pcm.h"

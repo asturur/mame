@@ -1,18 +1,6 @@
 // license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi, Jacob Jewell
-/***************************************************************************
-
-    Nokia N-Gage (NEM-4) and N-Gage QD (RH-29)
-
-    UPP_WD2 behavior and NOR commands are based on the NEM-4 FPGA study.
-    The ASIC ROM is undumped. Only the observed startup call at 0x03de
-    has a return stub. CBUS and flash programming use transaction-level
-    models. The UPP DSP provides MDI version replies and signed mono PCM. D550 models
-    audio DSP startup and diagnostics over EUART1. The UPP LCD DMA path
-    supports packed writes to the panel. SIMIF can use a synthetic GSM test
-    card. The native MMC path models the host and card at transaction level.
-
-***************************************************************************/
+// thanks-to: razvang-dev for the help with the firmware decryption
 
 #include "emu.h"
 
@@ -25,9 +13,11 @@
 #include "ngage_sim.h"
 
 #include "cpu/arm7/arm7.h"
-#include "machine/nvram.h"
+#include "machine/intelfsh.h"
 
 #include "emupal.h"
+#include "emuopts.h"
+#include "fileio.h"
 #include "screen.h"
 #include "speaker.h"
 
@@ -59,6 +49,7 @@ public:
 
 protected:
 	static constexpr u32 NOR_SIZE = 0x800000;
+	static constexpr u32 PMM_SIZE = 0x10000;
 	static constexpr u32 UPP_WORDS = 0x100000 / 4;
 	static constexpr u32 LCD_WIDTH = 176;
 	static constexpr u32 LCD_HEIGHT = 208;
@@ -69,9 +60,7 @@ protected:
 			u32 cs0_size, u16 rtc_calibration, u16 uem_product_bits)
 		: driver_device(mconfig, type, tag)
 		, m_maincpu(*this, "maincpu")
-		, m_flash(*this, "flash")
-		, m_pmm_nvram(*this, "pmm")
-		, m_cdrive_nvram(*this, "cdrive")
+		, m_nor(*this, "cs%u", 0)
 		, m_bt(*this, "bluetooth")
 		, m_mmc(*this, "mmc")
 		, m_rtc(*this, "rtc")
@@ -88,9 +77,10 @@ protected:
 	virtual void machine_reset() override ATTR_COLD;
 
 	void common(machine_config &config, bool mmc_hot_swap) ATTR_COLD;
-	template <bool Samsung> void common_map(address_map &map) ATTR_COLD;
-	template <u32 Chip, bool Samsung> u16 flash_r(offs_t offset);
-	template <u32 Chip, bool Samsung> void flash_w(offs_t offset, u16 data, u16 mem_mask);
+	void common_map(address_map &map) ATTR_COLD;
+	u16 flash0_r(offs_t offset);
+	u32 cdrive_r(offs_t offset, u32 mem_mask);
+	template <unsigned Chip> void flash_w(offs_t offset, u16 data, u16 mem_mask);
 	void recover_calendar_mirror() ATTR_COLD;
 	void euart_update();
 
@@ -105,6 +95,10 @@ protected:
 	virtual void audio_dsp_receive() { }
 
 	required_device<arm920t_cpu_device> m_maincpu;
+	required_device_array<intelfsh16_device, 2> m_nor;
+	std::vector<u16> m_decoded_nos;
+	u32 m_nos_start = 0;
+	u32 m_nos_end = 0;
 	u32 m_upp[UPP_WORDS]{};
 	u16 m_uem_regs[256]{};
 	u16 m_euart_enable = 0;
@@ -116,7 +110,6 @@ protected:
 	bool m_key_gpio30 = false;
 
 private:
-	static constexpr u32 PMM_SIZE = 0x10000;
 	static constexpr u32 SDRAM_BASE = 0x0a000000;
 	static constexpr u32 SDRAM_END = 0x0b000000;
 	static constexpr u32 UPP_ROM_BASE = 0x0c000000;
@@ -137,10 +130,9 @@ private:
 	static constexpr u32 MDI_RX_POINTERS = 0x3ec / 4;
 	static constexpr u32 MDI_CONTROL = 0x4b004 / 4;
 
+	void load_flash_initial_state() ATTR_COLD;
+	void import_legacy_flash_tail(char const *chip, char const *legacy, u8 *dest, u32 size) ATTR_COLD;
 	static u16 descramble_nos(u16 cipher, u32 address);
-	template <u32 Chip> u8 *flash_storage(u32 addr);
-	template <bool Samsung> u32 cdrive_r(offs_t offset, u32 mem_mask);
-	void finish_cdrive_erase();
 	u32 upp_r(offs_t offset, u32 mem_mask);
 	void upp_w(offs_t offset, u32 data, u32 mem_mask);
 	u16 uem_r(u8 reg) const;
@@ -180,12 +172,6 @@ private:
 	TIMER_CALLBACK_MEMBER(mdi_announce);
 	TIMER_CALLBACK_MEMBER(uem_tick);
 
-	enum : u8 { ARRAY, IDENTIFY, STATUS, PROTECTION, CFI };
-	enum : u8 { IDLE, AMD_PROGRAM, AMD_ERASE, INTEL_PROGRAM, INTEL_ERASE };
-
-	required_region_ptr<u8> m_flash;
-	required_device<nvram_device> m_pmm_nvram;
-	required_device<nvram_device> m_cdrive_nvram;
 	required_device<ngage_bt_device> m_bt;
 	required_device<ngage_mmc_device> m_mmc;
 	required_device<ngage_rtc_device> m_rtc;
@@ -196,20 +182,7 @@ private:
 	const u32 m_cs0_size;
 	const u16 m_rtc_calibration;
 	const u16 m_uem_product_bits;
-	std::vector<u16> m_decoded_nos;
-	u32 m_nos_start = 0;
-	u32 m_nos_end = 0;
-	u8 m_flash_mode[3]{};
-	u8 m_flash_unlock[3]{};
-	u8 m_flash_operation[3]{};
-	u8 m_flash_protection_bank[3]{};
-	u32 m_flash_erase_sector[3]{};
-	bool m_flash_amd_tail[3]{};
-	u8 m_pmm[PMM_SIZE]{};
-	u8 m_cdrive[CDRIVE_SIZE]{};
-	u32 m_cdrive_erase_base = 0;
-	u32 m_cdrive_erase_size = 0;
-	bool m_cdrive_erase_polled = false;
+	bool m_flash_initialized = false;
 
 	std::bitset<UPP_WORDS> m_upp_reads;
 	std::bitset<UPP_WORDS> m_upp_writes;
@@ -262,6 +235,7 @@ class ngage_nem4_state : public ngage_state
 public:
 	ngage_nem4_state(machine_config const &mconfig, device_type type, char const *tag)
 		: ngage_state(mconfig, type, tag, NOR_SIZE, 1, 0)
+		, m_flash2(*this, "cs2")
 		, m_adsp(*this, "adsp")
 	{
 	}
@@ -277,6 +251,7 @@ private:
 	static constexpr u32 LCD_PAIRS = LCD_ROW_PAIRS * LCD_HEIGHT;
 
 	void nem4_map(address_map &map) ATTR_COLD;
+	void flash2_w(offs_t offset, u16 data, u16 mem_mask);
 	virtual keypad_levels keypad_matrix(u8 row_low, u8 column_low) const override;
 	virtual u32 lcd_r(offs_t offset, u32 mem_mask) override;
 	virtual void lcd_w(offs_t offset, u32 data) override;
@@ -288,6 +263,7 @@ private:
 	virtual void audio_dsp_receive() override;
 	void lcd_header_w(u32 data);
 
+	required_device<amd_am29n643g_device> m_flash2;
 	required_device<ngage_adsp_device> m_adsp;
 	u8 m_adsp_controls_written = 0;
 	u16 m_lcd_pixels[LCD_WIDTH * LCD_HEIGHT]{};
@@ -373,26 +349,45 @@ u16 ngage_state::descramble_nos(u16 cipher, u32 address)
 	return plain;
 }
 
-void ngage_state::machine_start()
+void ngage_state::import_legacy_flash_tail(char const *chip, char const *legacy, u8 *dest, u32 size)
 {
-	m_pcm->set_memory(m_maincpu->space(AS_PROGRAM), SDRAM_BASE, SDRAM_END);
-	auto const word32 = [this](u32 offset)
-	{
-		return u32(m_flash[offset]) | (u32(m_flash[offset + 1]) << 8)
-			| (u32(m_flash[offset + 2]) << 16) | (u32(m_flash[offset + 3]) << 24);
-	};
+	std::string const directory = std::string(machine().basename()) + PATH_SEPARATOR;
+	emu_file file(machine().options().nvram_directory(), OPEN_FLAG_READ);
+	if (file.open(directory + chip) != std::errc::no_such_file_or_directory)
+		return;
+	if (file.open(directory + legacy))
+		return;
 
-	u32 const first = word32(0x174);
-	u32 const end = word32(0x178);
-	if (!((first | end) & 0xfff) && first < end && end <= m_cs0_size)
+	std::vector<u8> data(size);
+	if (file.size() != size || file.read(data.data(), size) != size)
+	{
+		logerror("Ignoring incorrectly sized legacy NVRAM %s\n", file.filename());
+		return;
+	}
+	std::copy(data.begin(), data.end(), dest);
+}
+
+void ngage_state::load_flash_initial_state()
+{
+	import_legacy_flash_tail("cs0", "pmm", m_nor[0]->base() + m_cs0_size - PMM_SIZE, PMM_SIZE);
+	import_legacy_flash_tail("cs1", "cdrive", m_nor[1]->base() + NOR_SIZE - CDRIVE_SIZE, CDRIVE_SIZE);
+
+	u8 const *const cs0 = m_nor[0]->base();
+	u32 const first = get_u32le(cs0 + 0x174);
+	u32 const end = get_u32le(cs0 + 0x178);
+	if (!((first | end) & 0xfff) && first < end && end <= m_cs0_size - PMM_SIZE)
 	{
 		m_nos_start = first;
 		m_nos_end = end;
 		m_decoded_nos.reserve((end - first) / 2);
 		for (u32 addr = first; addr < end; addr += 2)
-			m_decoded_nos.push_back(descramble_nos(m_flash[addr] | (m_flash[addr + 1] << 8), addr));
+			m_decoded_nos.push_back(descramble_nos(get_u16le(cs0 + addr), addr));
 	}
+}
 
+void ngage_state::machine_start()
+{
+	m_pcm->set_memory(m_maincpu->space(AS_PROGRAM), SDRAM_BASE, SDRAM_END);
 	for (u32 n = 0; n < std::size(m_timer); ++n)
 		m_timer[n] = timer_alloc(FUNC(ngage_state::timer_expired), this);
 	m_ctsi_compare_timer = timer_alloc(FUNC(ngage_state::ctsi_compare_expired), this);
@@ -400,20 +395,7 @@ void ngage_state::machine_start()
 	m_uem_timer = timer_alloc(FUNC(ngage_state::uem_tick), this);
 	for (auto &timer : m_lcd_dma_timer)
 		timer = timer_alloc(FUNC(ngage_state::lcd_dma_complete), this);
-	m_pmm_nvram->set_base(m_pmm, sizeof(m_pmm));
-	m_cdrive_nvram->set_base(m_cdrive, sizeof(m_cdrive));
 
-	save_item(NAME(m_flash_mode));
-	save_item(NAME(m_flash_unlock));
-	save_item(NAME(m_flash_operation));
-	save_item(NAME(m_flash_protection_bank));
-	save_item(NAME(m_flash_erase_sector));
-	save_item(NAME(m_flash_amd_tail));
-	save_item(NAME(m_pmm));
-	save_item(NAME(m_cdrive));
-	save_item(NAME(m_cdrive_erase_base));
-	save_item(NAME(m_cdrive_erase_size));
-	save_item(NAME(m_cdrive_erase_polled));
 	save_item(NAME(m_upp));
 	save_item(NAME(m_irq_enable));
 	save_item(NAME(m_fiq_enable));
@@ -479,16 +461,17 @@ void ngage_nem4_state::machine_start()
 
 void ngage_state::machine_reset()
 {
+	if (!m_flash_initialized)
+	{
+		load_flash_initial_state();
+		m_flash_initialized = true;
+	}
+
 	ioport_field::user_settings clock_config;
 	m_config->field(0x0e)->get_user_settings(clock_config);
 	u32 const half_steps = (clock_config.value >> 1) & 7;
 	m_maincpu->set_unscaled_clock(ARM_SDRAM_CLOCK + (half_steps <= 4 ? half_steps : 0) * (ARM_SDRAM_CLOCK / 2));
 
-	finish_cdrive_erase();
-	std::fill(std::begin(m_flash_mode), std::end(m_flash_mode), ARRAY);
-	std::fill(std::begin(m_flash_unlock), std::end(m_flash_unlock), 0);
-	std::fill(std::begin(m_flash_operation), std::end(m_flash_operation), IDLE);
-	std::fill(std::begin(m_flash_amd_tail), std::end(m_flash_amd_tail), false);
 	std::fill(std::begin(m_upp), std::end(m_upp), 0);
 	std::fill(std::begin(m_irq_enable), std::end(m_irq_enable), 0);
 	std::fill(std::begin(m_fiq_enable), std::end(m_fiq_enable), 0);
@@ -545,199 +528,6 @@ void ngage_nem4_state::machine_reset()
 	m_lcd_command = m_lcd_window_words = 0;
 	m_lcd_columns_valid = m_lcd_rows_valid = true;
 	m_lcd_write = m_lcd_pixel_header = m_lcd_on = false;
-}
-
-template <u32 Chip>
-u8 *ngage_state::flash_storage(u32 addr)
-{
-	if (Chip == 0 && addr >= m_cs0_size - PMM_SIZE)
-		return &m_pmm[addr - (m_cs0_size - PMM_SIZE)];
-	if (Chip == 1 && addr >= NOR_SIZE - CDRIVE_SIZE)
-		return &m_cdrive[addr - (NOR_SIZE - CDRIVE_SIZE)];
-	return nullptr;
-}
-
-template <u32 Chip, bool Samsung>
-u16 ngage_state::flash_r(offs_t offset)
-{
-	u32 const addr = offset * 2;
-	switch (m_flash_mode[Chip])
-	{
-	case IDENTIFY:
-		if constexpr (Samsung)
-		{
-			switch (addr & 0x1ff)
-			{
-			case 0x00: return 0x00ec;
-			case 0x02: return Chip == 0 ? 0x22f8 : 0x22fa;
-			default: return 0;
-			}
-		}
-		switch (Chip == 1 && addr >= NOR_SIZE - CDRIVE_SIZE ? addr & 0x0f : addr)
-		{
-		case 0x00: return 0x0001;
-		case 0x02: return 0x257e;
-		case 0x06: return 0x0042;
-		case 0x1c: return 0x2502;
-		case 0x1e: return 0x2500;
-		default: return 0;
-		}
-	case STATUS:
-		return 0x0080;
-	case CFI:
-	{
-		static constexpr u8 query[] = { 'Q', 'R', 'Y', 2, 0, 0x40 };
-		u32 const word = offset & 0xff;
-		if (word >= 0x10 && word < 0x10 + std::size(query))
-			return query[word - 0x10];
-		return word == 0x27 ? (Chip == 0 ? 24 : 23) : 0;
-	}
-	case PROTECTION:
-		if ((addr >> 21) == m_flash_protection_bank[Chip])
-			return 1;
-		break;
-	}
-
-	if (Chip == 0 && addr >= m_nos_start && addr < m_nos_end)
-		return m_decoded_nos[(addr - m_nos_start) / 2];
-
-	if (u8 const *const storage = flash_storage<Chip>(addr))
-		return storage[0] | (storage[1] << 8);
-
-	u32 const index = Chip == 0 ? addr : m_cs0_size + (Chip - 1) * NOR_SIZE + addr;
-	return m_flash[index] | (m_flash[index + 1] << 8);
-}
-
-template <bool Samsung>
-u32 ngage_state::cdrive_r(offs_t offset, u32 mem_mask)
-{
-	u32 const addr = NOR_SIZE - CDRIVE_SIZE + offset * 4;
-	if (m_flash_mode[1] == ARRAY && m_cdrive_erase_size && addr >= m_cdrive_erase_base
-			&& addr - m_cdrive_erase_base < m_cdrive_erase_size)
-	{
-		// NOS first waits for DQ3 set and DQ7 clear. The FPGA model
-		// completes on a second status read or an erase suspend command.
-		if (!m_cdrive_erase_polled)
-		{
-			if (!machine().side_effects_disabled())
-				m_cdrive_erase_polled = true;
-			return 0x00080008;
-		}
-		if (!machine().side_effects_disabled())
-			finish_cdrive_erase();
-		return 0xffffffff;
-	}
-
-	u32 const low = (mem_mask & 0xffff) ? flash_r<1, Samsung>(addr / 2) : 0;
-	u32 const high = (mem_mask & 0xffff0000) ? flash_r<1, Samsung>(addr / 2 + 1) : 0;
-	return low | (high << 16);
-}
-
-void ngage_state::finish_cdrive_erase()
-{
-	if (m_cdrive_erase_size)
-	{
-		std::fill_n(flash_storage<1>(m_cdrive_erase_base), m_cdrive_erase_size, 0xff);
-		m_cdrive_erase_size = 0;
-		m_cdrive_erase_polled = false;
-	}
-}
-
-template <u32 Chip, bool Samsung>
-void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
-{
-	u32 const addr = offset * 2;
-	u8 const unlock = m_flash_unlock[Chip];
-	u8 &mode = m_flash_mode[Chip];
-	u8 &operation = m_flash_operation[Chip];
-	u8 *const storage = flash_storage<Chip>(addr);
-	u32 const chip_size = Chip == 0 ? m_cs0_size : NOR_SIZE;
-	u32 const sector_size = Samsung ? (addr >= chip_size - PMM_SIZE ? 0x2000 : 0x10000)
-		: (Chip == 0 || (addr & 0x1fffff) >= 0x1f0000 ? 0x4000 : 0x10000);
-	u32 const sector = addr & ~(sector_size - 1);
-	u32 const command_address = addr & (Samsung ? 0xfff : 0x7ff);
-	u32 const unlock_address = Samsung ? 0xaaa : 0x2aa;
-
-	if (mem_mask != 0xffff)
-		return;
-
-	m_flash_unlock[Chip] = 0;
-	if (operation == AMD_PROGRAM || operation == INTEL_PROGRAM)
-	{
-		if (storage)
-		{
-			storage[0] &= u8(data);
-			storage[1] &= u8(data >> 8);
-		}
-		mode = operation == AMD_PROGRAM ? ARRAY : STATUS;
-		m_flash_amd_tail[Chip] = operation == AMD_PROGRAM;
-		operation = IDLE;
-	}
-	else if ((operation == AMD_ERASE && unlock == 2 && data == 0x30)
-		|| (operation == INTEL_ERASE && data == 0xd0 && m_flash_erase_sector[Chip] == sector))
-	{
-		if (Chip == 1 && storage && operation == AMD_ERASE)
-		{
-			finish_cdrive_erase();
-			m_cdrive_erase_base = sector;
-			m_cdrive_erase_size = sector_size;
-		}
-		else if (storage)
-			std::fill_n(flash_storage<Chip>(sector), sector_size, 0xff);
-		mode = operation == AMD_ERASE ? ARRAY : STATUS;
-		operation = IDLE;
-	}
-	else if (Chip == 1 && storage && data == 0xb0)
-		finish_cdrive_erase();
-	else if (data == 0xf0 || data == 0xff)
-	{
-		mode = ARRAY;
-		operation = IDLE;
-		m_flash_amd_tail[Chip] = false;
-	}
-	else if (command_address == unlock_address && data == 0xaa)
-		m_flash_unlock[Chip] = 1;
-	else if (unlock == 1 && command_address == 0x554 && data == 0x55)
-		m_flash_unlock[Chip] = 2;
-	else if (unlock == 2 && command_address == unlock_address && data == 0xa0)
-		operation = AMD_PROGRAM;
-	else if (unlock == 2 && command_address == unlock_address && data == 0x80)
-		operation = AMD_ERASE;
-	else if (Samsung && command_address == 0xaa && data == 0x98)
-		mode = CFI;
-	else if (data == 0x90 && ((unlock == 2 && command_address == unlock_address) || (!unlock && (addr == 0 || addr == 0xaaaa))))
-		mode = IDENTIFY;
-	else if (unlock == 2 && (offset & 0xfff) == 0x555 && data == 0xc0)
-	{
-		mode = PROTECTION;
-		m_flash_protection_bank[Chip] = addr >> 21;
-	}
-	else if (data == 0x70)
-		mode = STATUS;
-	else if (data == 0x50)
-		mode = ARRAY;
-	else if (!Samsung && data == 0x60)
-	{
-		mode = PROTECTION;
-		m_flash_protection_bank[Chip] = addr >> 21;
-	}
-	else if (mode == PROTECTION && (data == 0x01 || data == 0xd0))
-		mode = ARRAY;
-	else if (data == 0x40 && storage)
-		operation = INTEL_PROGRAM;
-	else if (data == 0x20)
-	{
-		// The native AMD programmer issues 0x20 after programming.
-		if (m_flash_amd_tail[Chip])
-			m_flash_amd_tail[Chip] = false;
-		else if (storage)
-		{
-			operation = INTEL_ERASE;
-			m_flash_erase_sector[Chip] = sector;
-		}
-	}
-	else
-		logerror("%s: unimplemented NOR CS%u write %04x at %06x\n", machine().describe_context(), Chip, data, addr);
 }
 
 u32 ngage_state::interrupt_sources(u32 bank, bool fiq) const
@@ -803,7 +593,6 @@ u32 ngage_state::timer_count(u32 n) const
 	if (!m_timer[n]->enabled())
 		return m_timer_stopped_count[n];
 
-	// Round up so the polling register reaches zero at the expiry event.
 	return (m_timer[n]->remaining() + attotime::from_ticks(1, GENERAL_TIMER_CLOCK)).as_ticks(GENERAL_TIMER_CLOCK);
 }
 
@@ -835,16 +624,14 @@ void ngage_state::recover_calendar_mirror()
 	if (!(m_config->read() & REPAIR_CALENDAR_MIRROR))
 		return;
 
-	// Stock 4.03 can persist the two RTC calendar mirrors a minute apart.
-	// Its restore guard rejects that pair. Repair the older mirror only
-	// when both active records are unique and in the same native catalog.
+	// NEM-4 4.03 rejects PMM calendar mirrors saved one minute apart.
 	static constexpr u32 SECTOR_SIZE = 0x4000;
 	static constexpr u32 HEADER_SIZE = 12;
 	u8 *records[2]{};
 	u32 record_bank = PMM_SIZE;
 	for (u32 bank = 0; bank < PMM_SIZE; bank += SECTOR_SIZE)
 	{
-		u8 *const sector = &m_pmm[bank];
+		u8 *const sector = m_nor[0]->base() + m_cs0_size - PMM_SIZE + bank;
 		if (std::memcmp(&sector[6], "PMMCAT", 6))
 			continue;
 		for (u32 offset = 32; offset <= SECTOR_SIZE - HEADER_SIZE; )
@@ -882,8 +669,7 @@ void ngage_state::recover_calendar_mirror()
 
 u16 ngage_state::uem_r(u8 reg) const
 {
-	// The RTC read aliases share addresses with control writes. The guest
-	// maintains the date base in PMM and can set the counter's eight-bit day.
+	// UEM RTC reads alias control writes. The calendar base is in PMM.
 	if (u16(m_upp[0x50420 / 4]) == 7)
 	{
 		u32 const time = m_rtc->counter();
@@ -928,7 +714,7 @@ void ngage_state::uem_w(u8 reg, u16 data)
 		m_uem_adc_result = UEM_ADC_DEFAULT;
 		if ((data >> 12) == 12)
 		{
-			// UEM channel 12 samples that produce seven through one bars in NEM-4 4.03.
+			// NEM-4 4.03 battery bars (7 to 1), UEM ADC channel 12.
 			constexpr u16 BATTERY_VOLTAGE_ADC[] = { UEM_ADC_DEFAULT, 470, 465, 460, 450, 440, 430 };
 			ioport_field::user_settings battery;
 			m_config->field(BATTERY_LEVEL_MASK)->get_user_settings(battery);
@@ -1030,8 +816,7 @@ void ngage_state::mdi_update()
 		if (words > (producer + MDI_RING_WORDS - consumer) % MDI_RING_WORDS)
 			break;
 
-		// Native F1/A0 RF and software version requests use a synthetic
-		// revision and version string.
+		// F1/A0 return synthetic RF and software versions.
 		u8 const media = word(0) >> 8;
 		bool const version_request = length == 12 && (media == 0x12 || media == 0)
 			&& (word(0) & 0xfc) == 0x7c && (word(1) & 0xff) == 0xf1 && (word(4) & 0xff) == 0xa0;
@@ -1181,7 +966,7 @@ void ngage_state::mmc_dma_resume(u32 channel)
 	if (!transfer.remaining || !m_mmc->dma_ready(transfer.write))
 		return;
 
-	// The last FIFO access can signal DataIdle synchronously.
+	// The final FIFO access can re-enter DMA via DataIdle.
 	m_mmc_dma_running = true;
 	address_space &program = m_maincpu->space(AS_PROGRAM);
 	while (transfer.remaining && m_mmc->dma_ready(transfer.write))
@@ -1223,8 +1008,7 @@ void ngage_state::lcd_dma_start(u32 channel)
 		return;
 	}
 
-	// Deliver the FIFO data in a batch and pace completion by the minimum
-	// transfer time of the 16-bit SDRAM interface, clocked 1:1 with the ARM.
+	// SDRAM has a 16-bit data bus.
 	address_space &program = m_maincpu->space(AS_PROGRAM);
 	for (u32 n = 0; n < words; ++n)
 		lcd_data_w(program.read_dword(source + n * 4));
@@ -1294,8 +1078,7 @@ ngage_state::keypad_levels ngage_qd_state::keypad_matrix(u8 row_low, u8 column_l
 {
 	u8 rows = ~row_low & 0x1f;
 	u8 columns = ~column_low & 0x3f;
-	// QD ekeyb table 3. Port D drives its five columns and port E
-	// reads its six rows. The classic N-Gage scans the other way.
+	// QD ekeyb table 3: port D drives columns, port E reads rows.
 	static constexpr s8 positions[] = {
 		 0,  5,  1,  6,  9, 10,  4,  3, -1,  2, 27, 19, 12,
 		28, 24, 29, 17, 13, 18, 14, 22,  8, 23, 15,  7
@@ -1385,7 +1168,7 @@ u32 ngage_state::upp_r(offs_t offset, u32 mem_mask)
 		}
 		break;
 	case 0x48000:
-	case 0x49000: return m_upp[offset] | 1; // DPLL lock, with settling time unmeasured.
+	case 0x49000: return m_upp[offset] | 1; // DPLL lock delay unmeasured.
 	case 0x4b000: return m_upp[offset] | 0x80;
 	case 0x50000: return m_upp[offset] | 0x00400000; // GSM board strap.
 	case 0x50014: return (m_upp[offset] & ~GENIO_ENABLE_MASK) | ((m_ctsi_genio_enable * 0x10001U) & GENIO_ENABLE_MASK);
@@ -1896,20 +1679,56 @@ void ngage_state::nos_trace_w(u32 data, u32 mem_mask)
 	}
 }
 
-template <bool Samsung>
+u16 ngage_state::flash0_r(offs_t offset)
+{
+	u32 const address = offset * 2;
+	if (m_nor[0]->array_read_mode(offset) && address >= m_nos_start && address < m_nos_end)
+		return m_decoded_nos[(address - m_nos_start) / 2];
+
+	return m_nor[0]->read(offset);
+}
+
+u32 ngage_state::cdrive_r(offs_t offset, u32 mem_mask)
+{
+	u32 const word = (NOR_SIZE - CDRIVE_SIZE) / 2 + offset * 2;
+	if (m_nor[1]->erase_poll_pending(word))
+	{
+		// The 32-bit erase poll samples DQ3/DQ7 on both halfwords.
+		u32 const status = m_nor[1]->read(word);
+		return status | (status << 16);
+	}
+
+	u32 const low = (mem_mask & 0xffff) ? m_nor[1]->read(word) : 0;
+	u32 const high = (mem_mask & 0xffff0000) ? m_nor[1]->read(word + 1) : 0;
+	return low | (high << 16);
+}
+
+template <unsigned Chip>
+void ngage_state::flash_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	if (mem_mask == 0xffff)
+		m_nor[Chip]->write(offset, data);
+}
+
+void ngage_nem4_state::flash2_w(offs_t offset, u16 data, u16 mem_mask)
+{
+	if (mem_mask == 0xffff)
+		m_flash2->write(offset, data);
+}
+
 void ngage_state::common_map(address_map &map)
 {
-	map(0x02000000, 0x023fffff).r(&ngage_state::flash_r<1, Samsung>, "flash_r");
-	map(0x02400000, 0x027fffff).r(FUNC(ngage_state::cdrive_r<Samsung>));
-	map(0x02000000, 0x027fffff).w(&ngage_state::flash_w<1, Samsung>, "flash_w");
+	map(0x02000000, 0x023fffff).r(m_nor[1], FUNC(intelfsh16_device::read));
+	map(0x02400000, 0x027fffff).r(FUNC(ngage_state::cdrive_r));
+	map(0x02000000, 0x027fffff).w(FUNC(ngage_state::flash_w<1>));
 	map(0x08000000, 0x08000fff).ram(); // External memory controller latches
 	map(SDRAM_BASE, SDRAM_END - 1).ram();
 	map(UPP_ROM_BASE, UPP_ROM_BASE + UPP_ROM_SIZE - 1).rom().region("upp_rom", 0);
-	// Bring-up hack for the undumped UPP ROM. Remove the overlay when the ROM is dumped.
+	// Undumped UPP ROM: stub for the startup call at 0x03de.
 	static constexpr bool UPP_STARTUP_STUB = true;
 	if (UPP_STARTUP_STUB)
-		map(UPP_ROM_BASE + 0x3dc, UPP_ROM_BASE + 0x3df).lr32(NAME([] () -> u32 { return 0x47700000; })); // Thumb BX LR at 0x03de
-	map(0x0c001000, 0x0c0fffff).ram(); // On-chip RAM, including bootstrap scratch and DSP upload
+		map(UPP_ROM_BASE + 0x3dc, UPP_ROM_BASE + 0x3df).lr32(NAME([] () -> u32 { return 0x47700000; })); // Thumb BX LR
+	map(0x0c001000, 0x0c0fffff).ram(); // Bootstrap scratch and DSP upload RAM
 	map(0x0c100000, 0x0c1fffff).rw(FUNC(ngage_state::upp_r), FUNC(ngage_state::upp_w));
 	map(0x0d6d0000, 0x0d6d0003).w(FUNC(ngage_state::nos_trace_w));
 	map(0x0de00000, 0x0dffffff).w(FUNC(ngage_state::sti_w));
@@ -1917,22 +1736,21 @@ void ngage_state::common_map(address_map &map)
 
 void ngage_nem4_state::nem4_map(address_map &map)
 {
-	common_map<false>(map);
-	map(0x00000000, 0x007fffff).rw(&ngage_nem4_state::flash_r<0, false>, "flash_r", &ngage_nem4_state::flash_w<0, false>, "flash_w");
-	map(0x04000000, 0x047fffff).rw(&ngage_nem4_state::flash_r<2, false>, "flash_r", &ngage_nem4_state::flash_w<2, false>, "flash_w");
+	common_map(map);
+	map(0x00000000, 0x007fffff).rw(FUNC(ngage_nem4_state::flash0_r), FUNC(ngage_nem4_state::flash_w<0>));
+	map(0x04000000, 0x047fffff).r(m_flash2, FUNC(intelfsh16_device::read));
+	map(0x04000000, 0x047fffff).w(FUNC(ngage_nem4_state::flash2_w));
 }
 
 void ngage_qd_state::qd_map(address_map &map)
 {
-	common_map<true>(map);
-	map(0x00000000, 0x00ffffff).rw(&ngage_qd_state::flash_r<0, true>, "flash_r", &ngage_qd_state::flash_w<0, true>, "flash_w");
+	common_map(map);
+	map(0x00000000, 0x00ffffff).rw(FUNC(ngage_qd_state::flash0_r), FUNC(ngage_qd_state::flash_w<0>));
 }
 
 void ngage_state::common(machine_config &config, bool mmc_hot_swap)
 {
 	ARM920T(config, m_maincpu, ARM_SDRAM_CLOCK);
-	NVRAM(config, m_pmm_nvram, nvram_device::DEFAULT_ALL_1);
-	NVRAM(config, m_cdrive_nvram, nvram_device::DEFAULT_ALL_1);
 	NGAGE_BT(config, m_bt, 0);
 	m_bt->irq_cb().set(FUNC(ngage_state::bt_event));
 	NGAGE_MMC(config, m_mmc, 8'666'667);
@@ -1947,19 +1765,28 @@ void ngage_state::common(machine_config &config, bool mmc_hot_swap)
 	m_pcm->reply_ready().set(FUNC(ngage_state::pcm_reply_ready));
 
 	screen_device &screen(SCREEN(config, "screen").set_lcd());
-	screen.set_raw(6'500'000, 400, 0, LCD_WIDTH, 262, 0, LCD_HEIGHT); // Timing from the FPGA model
+	screen.set_raw(6'500'000, 400, 0, LCD_WIDTH, 262, 0, LCD_HEIGHT); // Provisional LCD timing
 	screen.set_screen_update(FUNC(ngage_state::screen_update));
 }
 
 void ngage_nem4_state::nem4(machine_config &config)
 {
 	common(config, false);
+	AMD_AM29N643G(config, "cs0").set_write_start(NOR_SIZE - PMM_SIZE);
+	auto &cs1 = AMD_AM29N643G(config, "cs1");
+	cs1.set_write_start(NOR_SIZE - CDRIVE_SIZE);
+	cs1.set_read_driven_erase(true);
+	AMD_AM29N643G(config, m_flash2).set_write_start(NOR_SIZE);
 	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_nem4_state::nem4_map);
 	NGAGE_ADSP(config, m_adsp, 0);
 }
 
 void ngage_qd_state::qd(machine_config &config)
 {
+	SAMSUNG_K8S2815ETA(config, "cs0").set_write_start(QD_CS0_SIZE - PMM_SIZE);
+	auto &cs1 = SAMSUNG_K8S6415ETA(config, "cs1");
+	cs1.set_write_start(NOR_SIZE - CDRIVE_SIZE);
+	cs1.set_read_driven_erase(true);
 	common(config, true);
 	NGAGE_QD_LCD(config, m_qd_lcd, 0);
 	m_maincpu->set_addrmap(AS_PROGRAM, &ngage_qd_state::qd_map);
@@ -1967,7 +1794,7 @@ void ngage_qd_state::qd(machine_config &config)
 
 INPUT_PORTS_START(ngage)
 	PORT_START("CONFIG")
-	PORT_CONFNAME(0x01, 0x00, "SIM Card")
+	PORT_CONFNAME(0x01, 0x01, "SIM Card")
 	PORT_CONFSETTING(0x00, DEF_STR(None))
 	PORT_CONFSETTING(0x01, "Test SIM")
 	PORT_CONFNAME(0x0e, 0x00, "ARM / SDRAM Clock")
@@ -2029,25 +1856,23 @@ INPUT_PORTS_START(ngageqd)
 	PORT_BIT(0x02000000, IP_ACTIVE_HIGH, IPT_UNUSED) // Music
 INPUT_PORTS_END
 
-// The NOR images assemble Nokia Phoenix MCU and PPM flash records, taking
-// language pack ranges from the PPM and preserving scrambled bytes. The
-// NEM-4 images are split into three 8 MiB chip selects and the QD images
-// into 16 MiB CS0 and 8 MiB CS1. Erased areas are filled with 0xff.
-// The C: regions contain default LFFS volumes generated by fresh guests
-// running the corresponding firmware with only system data.
-
 // NEM-4 4.03 MCU nem440.3c1 and PPM nem440.326.
 ROM_START(ngage)
 	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
 	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
 
-	ROM_REGION(0x1800000, "flash", 0)
-	ROM_LOAD("nem4_403_cs0.bin", 0x0000000, 0x800000, CRC(848f1c33) SHA1(1c420c64b15579706e9c3374f6dafc863825e9d7))
-	ROM_LOAD("nem4_403_cs1.bin", 0x0800000, 0x800000, CRC(8e8ace41) SHA1(33448698969d26af0984ae6a6716cfd9841c7fa5))
-	ROM_LOAD("nem4_403_cs2.bin", 0x1000000, 0x800000, CRC(436711c7) SHA1(21141142b373098c0871a3daa10238c694766ef4))
-
 	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
 	ROM_LOAD("nem4_403_cdrive.bin", 0, CDRIVE_SIZE, CRC(04981d42) SHA1(e9262db589cabdd00ab9a4df6659b56a86a1f259))
+
+	ROM_REGION(0x800000, "cs0", 0)
+	ROM_LOAD("nem4_403_cs0.bin", 0x000000, 0x800000, CRC(848f1c33) SHA1(1c420c64b15579706e9c3374f6dafc863825e9d7))
+
+	ROM_REGION(0x800000, "cs1", 0)
+	ROM_LOAD("nem4_403_cs1.bin", 0x000000, 0x800000, CRC(8e8ace41) SHA1(33448698969d26af0984ae6a6716cfd9841c7fa5))
+	ROM_COPY("cdrive", 0, 0x400000, CDRIVE_SIZE)
+
+	ROM_REGION(0x800000, "cs2", 0)
+	ROM_LOAD("nem4_403_cs2.bin", 0x000000, 0x800000, CRC(436711c7) SHA1(21141142b373098c0871a3daa10238c694766ef4))
 ROM_END
 
 // RH-29 4.10 MCU RH2941.0C1 and PPM RH2941.021.
@@ -2055,26 +1880,34 @@ ROM_START(ngageqd)
 	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
 	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
 
-	ROM_REGION(0x1800000, "flash", 0)
-	ROM_LOAD("rh29_410_cs0.bin", 0x0000000, 0x1000000, CRC(ec170b2c) SHA1(78879c4f6c83a6fbd9c5bc30d8de6ae50db8d898))
-	ROM_LOAD("rh29_410_cs1.bin", 0x1000000, 0x800000, CRC(a276df3a) SHA1(9fd6364bff02167db339e1d89ec0cade5de4e48e))
-
 	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
 	ROM_LOAD("rh29_410_cdrive.bin", 0, CDRIVE_SIZE, CRC(f48e64d2) SHA1(70dc94e43f285184871f866fbbb7a0e6f0967b20))
+
+	ROM_REGION(0x1000000, "cs0", 0)
+	ROM_LOAD("rh29_410_cs0.bin", 0x000000, 0x1000000, CRC(ec170b2c) SHA1(78879c4f6c83a6fbd9c5bc30d8de6ae50db8d898))
+
+	ROM_REGION(0x800000, "cs1", 0)
+	ROM_LOAD("rh29_410_cs1.bin", 0x000000, 0x800000, CRC(a276df3a) SHA1(9fd6364bff02167db339e1d89ec0cade5de4e48e))
+	ROM_COPY("cdrive", 0, 0x400000, CDRIVE_SIZE)
 ROM_END
 
-// NEM-4 4.17 MCU nem441.7d1 (CRC32 adfd7b51) and PPM nem441.738.
+// NEM-4 4.17 MCU nem441.7d1 and PPM nem441.738.
 ROM_START(ngage417)
 	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
 	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
 
-	ROM_REGION(0x1800000, "flash", 0)
-	ROM_LOAD("nem4_417_cs0.bin", 0x0000000, 0x800000, CRC(dd63247f) SHA1(d9def4cf64f885737cee562ace349d7c22e4b387))
-	ROM_LOAD("nem4_417_cs1.bin", 0x0800000, 0x800000, CRC(38f7a1c1) SHA1(e3401877ac47380d3795718b69df1edd0b8f2e3b))
-	ROM_LOAD("nem4_417_cs2.bin", 0x1000000, 0x800000, CRC(f8f93ab7) SHA1(df266bebd73e63398fdf29e1d5651476fac3e582))
-
 	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
 	ROM_LOAD("nem4_417_cdrive.bin", 0, CDRIVE_SIZE, CRC(cca69008) SHA1(341a1330f9ab8bb917bc32891677986ffd390d1d))
+
+	ROM_REGION(0x800000, "cs0", 0)
+	ROM_LOAD("nem4_417_cs0.bin", 0x000000, 0x800000, CRC(dd63247f) SHA1(d9def4cf64f885737cee562ace349d7c22e4b387))
+
+	ROM_REGION(0x800000, "cs1", 0)
+	ROM_LOAD("nem4_417_cs1.bin", 0x000000, 0x800000, CRC(38f7a1c1) SHA1(e3401877ac47380d3795718b69df1edd0b8f2e3b))
+	ROM_COPY("cdrive", 0, 0x400000, CDRIVE_SIZE)
+
+	ROM_REGION(0x800000, "cs2", 0)
+	ROM_LOAD("nem4_417_cs2.bin", 0x000000, 0x800000, CRC(f8f93ab7) SHA1(df266bebd73e63398fdf29e1d5651476fac3e582))
 ROM_END
 
 // RH-29 4.15 MCU rh2941.5C1 and PPM rh2941.570.
@@ -2082,12 +1915,31 @@ ROM_START(ngageqd415)
 	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
 	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
 
-	ROM_REGION(0x1800000, "flash", 0)
-	ROM_LOAD("rh29_415_cs0.bin", 0x0000000, 0x1000000, CRC(22e846cc) SHA1(b3081f5c82b574ddd1d3ce28bd300f132a920849))
-	ROM_LOAD("rh29_415_cs1.bin", 0x1000000, 0x800000, CRC(b59ec15b) SHA1(f21b6ed8fbff202f666365931cba657ac97168ce))
-
 	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
 	ROM_LOAD("rh29_415_cdrive.bin", 0, CDRIVE_SIZE, CRC(77ec1a78) SHA1(2641a3c53d16b77a9b4dd73a08d215775bc7a166))
+
+	ROM_REGION(0x1000000, "cs0", 0)
+	ROM_LOAD("rh29_415_cs0.bin", 0x000000, 0x1000000, CRC(22e846cc) SHA1(b3081f5c82b574ddd1d3ce28bd300f132a920849))
+
+	ROM_REGION(0x800000, "cs1", 0)
+	ROM_LOAD("rh29_415_cs1.bin", 0x000000, 0x800000, CRC(b59ec15b) SHA1(f21b6ed8fbff202f666365931cba657ac97168ce))
+	ROM_COPY("cdrive", 0, 0x400000, CDRIVE_SIZE)
+ROM_END
+
+// RH-29 4.60 MCU RH2946.0C1 and PPM RH2946.0S5. The C: seed is shared with 4.15.
+ROM_START(ngageqd460)
+	ROM_REGION32_LE(UPP_ROM_SIZE, "upp_rom", ROMREGION_ERASE00)
+	ROM_LOAD("upp_wd2_internal.rom", 0, UPP_ROM_SIZE, NO_DUMP)
+
+	ROM_REGION(CDRIVE_SIZE, "cdrive", ROMREGION_ERASEFF)
+	ROM_LOAD("rh29_460_cdrive.bin", 0, CDRIVE_SIZE, CRC(77ec1a78) SHA1(2641a3c53d16b77a9b4dd73a08d215775bc7a166))
+
+	ROM_REGION(0x1000000, "cs0", 0)
+	ROM_LOAD("rh29_460_cs0.bin", 0x000000, 0x1000000, CRC(8fb53e2e) SHA1(a87d62ed8b4cd547e82c87fd0fb4d99c8b64b608))
+
+	ROM_REGION(0x800000, "cs1", 0)
+	ROM_LOAD("rh29_460_cs1.bin", 0x000000, 0x800000, CRC(25169246) SHA1(31e9227ae51d7d10f9c9750408d1e57e73854e47))
+	ROM_COPY("cdrive", 0, 0x400000, CDRIVE_SIZE)
 ROM_END
 
 } // anonymous namespace
@@ -2096,3 +1948,4 @@ SYST(2003, ngage, 0, 0, nem4, ngage, ngage_nem4_state, empty_init, "Nokia", "N-G
 SYST(2004, ngageqd, 0, 0, qd, ngageqd, ngage_qd_state, empty_init, "Nokia", "N-Gage QD (RH-29, firmware 4.10)", MACHINE_NOT_WORKING)
 SYST(2004, ngage417, ngage, 0, nem4, ngage, ngage_nem4_state, empty_init, "Nokia", "N-Gage (NEM-4, firmware 4.17)", MACHINE_NOT_WORKING)
 SYST(2004, ngageqd415, ngageqd, 0, qd, ngageqd, ngage_qd_state, empty_init, "Nokia", "N-Gage QD (RH-29, firmware 4.15)", MACHINE_NOT_WORKING)
+SYST(2004, ngageqd460, ngageqd, 0, qd, ngageqd, ngage_qd_state, empty_init, "Nokia", "N-Gage QD (RH-29, firmware 4.60)", MACHINE_NOT_WORKING)

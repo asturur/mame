@@ -1,19 +1,7 @@
 // license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
-/*
-    NEM-4 D550 (TMS320DA250GHH-144) audio DSP startup stub.
-
-    The Nokia Phoenix NEM_4.ini lists E403A400H450.USB as its AdspFile.
-    D551 is a 2 MiB NOR, of which the service file supplies 0x16fc4a bytes.
-    The provisional C55x program-byte map follows the vectors and code
-    cross-references documented in the MiSTer ADSP ROM investigation.
-    The stub copies the recovered load records into its boot RAM.
-
-    The startup packets and XOR16 framing follow the original trace and
-    the MiSTer D550 peer. Diagnostic 0x42 checks the mapped D551 signature;
-    the clock and N501 codec reset are modeled as ready. C55x execution,
-    audio output and general application services are unimplemented.
-*/
+// Phoenix NEM_4.ini lists E403A400H450.USB for the D550 audio DSP.
+// D551 is a 2 MiB program NOR. C55x execution is unimplemented.
 
 #include "emu.h"
 #include "ngage_adsp.h"
@@ -37,7 +25,7 @@ ROM_END
 
 } // anonymous namespace
 
-DEFINE_DEVICE_TYPE(NGAGE_ADSP, ngage_adsp_device, "ngage_adsp", "N-Gage D550 (TMS320DA250) Startup Stub")
+DEFINE_DEVICE_TYPE(NGAGE_ADSP, ngage_adsp_device, "ngage_adsp", "N-Gage D550 (TMS320DA250) Startup Stub HLE")
 
 ngage_adsp_device::ngage_adsp_device(machine_config const &mconfig, char const *tag, device_t *owner, u32 clock)
 	: device_t(mconfig, NGAGE_ADSP, tag, owner, clock)
@@ -90,7 +78,7 @@ bool ngage_adsp_device::load_boot_ram()
 		if (BOOT_TABLE_END - cursor < BOOT_RECORD_HEADER)
 			return false;
 
-		// This table counts 16-bit words. The program mapping uses bytes.
+		// D551 load record lengths are in 16-bit words.
 		u32 const word_address = get_u32be(&m_d551[cursor]);
 		u32 const words = get_u32be(&m_d551[cursor + 4]);
 		cursor += BOOT_RECORD_HEADER;
@@ -111,7 +99,6 @@ bool ngage_adsp_device::load_boot_ram()
 	if (cursor != BOOT_TABLE_END || get_u64be(&m_d551[cursor]) != 0xffffffffffffffffULL)
 		return false;
 
-	// Give RAM bytes outside the records a deterministic placeholder value.
 	std::fill_n(m_boot_ram.target(), BOOT_RAM_BYTES, 0);
 	for (auto const &record : records)
 		std::copy_n(&m_d551[record.source], record.size, &m_boot_ram[record.address]);
@@ -324,8 +311,6 @@ void ngage_adsp_device::handle_frame()
 	if (!reply_size)
 		return;
 
-	// Test 0x42 covers the modeled boot prerequisites. Other tests and
-	// unimplemented gain/control operations return the original error codes.
 	constexpr u32 D551_MARKER_ADDRESS = D551_BASE + 0x160000;
 	constexpr u16 D551_MARKER = 0xfffc;
 	u16 const test = (u16(data[6]) << 8) | data[7];

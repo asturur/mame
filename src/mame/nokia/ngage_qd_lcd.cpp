@@ -1,10 +1,7 @@
 // license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi, Jacob Jewell, the NGage_MiSTer authors
-/*
-    N-Gage QD LCD, adapted from ngage2 model/hw/ngage_lcd.c.
-    The UPP transfer phases carry DCS commands, parameters and packed pixels.
-    The modeled 0x29 ID selects the QD driver's module 0x10 path.
-*/
+// Adapted from ngage2 model/hw/ngage_lcd.c.
+// LCD ID 0x29 selects module 0x10 in the QD display driver.
 
 #include "emu.h"
 #include "ngage_qd_lcd.h"
@@ -154,8 +151,7 @@ void ngage_qd_lcd_device::data_w(u32 data)
 	{
 		u32 const lo = data & 0x0fff;
 		u32 const hi = (data >> 16) & 0x0fff;
-		// Parameter phases serialize low byte first. The pixel phase
-		// sends each RGB444 pixel most significant nibble first.
+		// Parameters are low byte first. RGB444 pixels are high nibble first.
 		data = BIT(m_control, 31)
 			? (lo >> 4) | ((lo & 15) << 12) | ((hi >> 8) << 8) | ((hi & 0xff) << 16)
 			: lo | (hi << 12);
@@ -317,7 +313,7 @@ void ngage_qd_lcd_device::draw(bitmap_rgb32 &bitmap, rectangle const &cliprect) 
 		return;
 	}
 
-	// The panel is mounted rotated 180 degrees in the QD reference.
+	// QD panel orientation is rotated 180 degrees.
 	for (int y = cliprect.top(); y <= cliprect.bottom(); ++y)
 	{
 		u32 const gram_row = HEIGHT - 1 - y;

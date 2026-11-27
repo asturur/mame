@@ -1,7 +1,5 @@
 // license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
-// N-Gage UPP native MMC host and byte-addressed card at transaction level.
-// The card image supplies the sectors and optionally the original CID/CSD/OCR.
 
 #include "emu.h"
 #include "ngage_mmc.h"
@@ -216,8 +214,6 @@ std::pair<std::error_condition, std::string> ngage_mmc_device::call_load()
 	if (payload > capacity)
 		return { image_error::INVALIDLENGTH, "MMC payload is larger than the footer's CSD capacity" };
 
-	// Save states may resume a transfer only against this particular open image.
-	// A new mount gets a new identity, even when reopening the same path.
 	std::random_device random;
 	u64 const high = u64(random()) << 32;
 	m_saved_mount_id = m_mount_id = (high | random()) | 1;
@@ -351,8 +347,7 @@ u32 ngage_mmc_device::response_r()
 	if (!machine().side_effects_disabled())
 	{
 		++m_response_pos;
-		// NEM-4 consumes three R2 words through CmdRdy, then waits for
-		// CmdIdle before reading the fourth word.
+		// NEM-4 reads the last R2 word on CmdIdle, the first three on CmdRdy.
 		if (m_response_words == 4 && m_response_pos == 3)
 			m_status &= ~CMD_BUSY;
 		if (m_response_pos == m_response_words)
@@ -449,7 +444,7 @@ void ngage_mmc_device::card_command()
 		if (addressed && m_card_state >= STANDBY && m_card_state != INACTIVE)
 			response(r1);
 		else if (m_type)
-			m_status |= RESP_TIMEOUT; // An unaddressed card does not answer the QD's status poll.
+			m_status |= RESP_TIMEOUT; // QD polls cards before assigning an address.
 		return;
 	case 15:
 		if (addressed)

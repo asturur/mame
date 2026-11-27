@@ -1,6 +1,6 @@
 // license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
-// Battery-backed UEM counter. The absolute calendar base belongs to NOS PMM.
+// UEM holds the battery-backed counter. NOS stores the calendar base in PMM.
 
 #include "emu.h"
 #include "ngage_rtc.h"
@@ -70,7 +70,6 @@ bool ngage_rtc_device::nvram_read(util::read_stream &file)
 	if (!*machine().options().playback() && rtc_override.size() == 14
 			&& rtc_override.find_first_not_of("0123456789") == std::string_view::npos)
 	{
-		// NOS keeps the absolute date in PMM. Override the UEM time of day.
 		set_counter(saved_counter - (saved_counter % DAY_SECONDS) + time_of_day(base));
 		return true;
 	}

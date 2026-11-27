@@ -1,7 +1,6 @@
 // license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi
-// Transaction-level UPP SIMIF and GSM T=0 test card from the NEM-4 FPGA study.
-// The card serves fixed test files and has no subscription or authentication.
+// Synthetic GSM T=0 test card without network authentication.
 
 #include "emu.h"
 #include "ngage_sim.h"
@@ -12,7 +11,7 @@
 #include "logmacro.h"
 #include <array>
 
-DEFINE_DEVICE_TYPE(NGAGE_SIM, ngage_sim_device, "ngage_sim", "N-Gage SIM interface")
+DEFINE_DEVICE_TYPE(NGAGE_SIM, ngage_sim_device, "ngage_sim", "N-Gage Test SIM")
 
 struct ngage_sim_device::test_file
 {
