@@ -16,6 +16,10 @@ public:
 	uint8_t *base() { return &m_data[0]; }
 
 	bool is_ready();
+	bool array_read_mode(offs_t offset) const;
+	bool erase_poll_pending(offs_t offset) const;
+	void set_write_start(u32 byte_address) { m_write_start = byte_address; }
+	void set_read_driven_erase(bool enable) { m_read_driven_erase = enable; }
 
 protected:
 	// construction/destruction
@@ -77,8 +81,22 @@ protected:
 	std::unique_ptr<uint8_t[]> m_page_buffer;
 
 	bool                     m_fast_mode;
+	bool                     m_little_endian = false;
+	bool                     m_nokia_n643 = false;
 
 private:
+	u16 read_word(u32 address) const;
+	void program_word(u32 address, u16 data);
+	u32 burst_sector_size(u32 byte_address) const;
+	u16 read_n643_id(u32 address) const;
+
+	u32                      m_write_start = 0;
+	u32                      m_erase_poll_words = 0;
+	u32                      m_protection_bank = 0;
+	bool                     m_erase_poll_seen = false;
+	bool                     m_read_driven_erase = false;
+	bool                     m_amd_programmed = false;
+
 	static constexpr uint32_t ERASE_BLOCK_SIZE = 8 * 1024;
 
 	void select_erase_sector(uint32_t address);
@@ -124,6 +142,24 @@ protected:
 
 
 // ======================> trivial variants
+
+class amd_am29n643g_device : public intelfsh16_device
+{
+public:
+	amd_am29n643g_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
+};
+
+class samsung_k8s2815eta_device : public intelfsh16_device
+{
+public:
+	samsung_k8s2815eta_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
+};
+
+class samsung_k8s6415eta_device : public intelfsh16_device
+{
+public:
+	samsung_k8s6415eta_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock = 0);
+};
 
 // 8-bit variants
 class intel_28f016s5_device : public intelfsh8_device
@@ -509,6 +545,9 @@ DECLARE_DEVICE_TYPE(SST_39SF040,             sst_39sf040_device)
 DECLARE_DEVICE_TYPE(SST_39VF020,             sst_39vf020_device)
 DECLARE_DEVICE_TYPE(SST_49LF020,             sst_49lf020_device)
 
+DECLARE_DEVICE_TYPE(AMD_AM29N643G,          amd_am29n643g_device)
+DECLARE_DEVICE_TYPE(SAMSUNG_K8S2815ETA,      samsung_k8s2815eta_device)
+DECLARE_DEVICE_TYPE(SAMSUNG_K8S6415ETA,      samsung_k8s6415eta_device)
 DECLARE_DEVICE_TYPE(SHARP_LH28F400,          sharp_lh28f400_device)
 DECLARE_DEVICE_TYPE(SHARP_LH28F800SG,        sharp_lh28f800sg_device)
 DECLARE_DEVICE_TYPE(INTEL_E28F008SA,         intel_e28f008sa_device)

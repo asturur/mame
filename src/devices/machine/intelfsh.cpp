@@ -24,6 +24,7 @@ Notes:
 #include "intelfsh.h"
 
 #include <algorithm>
+#include <bit>
 
 
 //**************************************************************************
@@ -57,6 +58,9 @@ enum
 	FM_FAST_RESET,
 	FM_WRITEPAGEWINBOND,
 	FM_ERASEAMDSELECT,
+	FM_READCFI,
+	FM_READPROTECTION,
+	FM_ERASEAMDPOLL,
 };
 
 } // anonymous namespace
@@ -79,6 +83,7 @@ enum
 	MFG_MACRONIX = 0xc2,
 	MFG_PANASONIC = 0x32,
 	MFG_PMC = 0x9d,
+	MFG_SAMSUNG = 0xec,
 	MFG_SANYO = 0x62,
 	MFG_SHARP = 0xb0,
 	MFG_SPANSION = 0x01,
@@ -141,6 +146,9 @@ DEFINE_DEVICE_TYPE(SST_39SF040,              sst_39sf040_device,              "s
 DEFINE_DEVICE_TYPE(SST_39VF020,              sst_39vf020_device,              "sst_39vf020",              "SST 39VF020 Flash")
 DEFINE_DEVICE_TYPE(SST_49LF020,              sst_49lf020_device,              "sst_49lf020",              "SST 49LF020 Flash")
 
+DEFINE_DEVICE_TYPE(AMD_AM29N643G,           amd_am29n643g_device,            "amd_am29n643g",           "AMD Am29N643G Flash")
+DEFINE_DEVICE_TYPE(SAMSUNG_K8S2815ETA,       samsung_k8s2815eta_device,       "samsung_k8s2815eta",       "Samsung K8S2815ETA Flash")
+DEFINE_DEVICE_TYPE(SAMSUNG_K8S6415ETA,       samsung_k8s6415eta_device,       "samsung_k8s6415eta",       "Samsung K8S6415ETA Flash")
 DEFINE_DEVICE_TYPE(SHARP_LH28F400,           sharp_lh28f400_device,           "sharp_lh28f400",           "Sharp LH28F400 Flash")
 DEFINE_DEVICE_TYPE(SHARP_LH28F800SG,         sharp_lh28f800sg_device,         "sharp_lh28f800sg",         "Sharp LH28F800SG Flash")
 DEFINE_DEVICE_TYPE(INTEL_E28F008SA,          intel_e28f008sa_device,          "intel_e28f008sa",          "Intel E28F008SA Flash")
@@ -339,6 +347,31 @@ sst_39vf020_device::sst_39vf020_device(const machine_config &mconfig, const char
 sst_49lf020_device::sst_49lf020_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
 	: intelfsh8_device(mconfig, SST_49LF020, tag, owner, clock, 0x40000, MFG_SST, 0x61) { m_sector_is_4k = true; }
 
+amd_am29n643g_device::amd_am29n643g_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock)
+	: intelfsh16_device(mconfig, AMD_AM29N643G, tag, owner, clock, 0x800000, MFG_AMD, 0x257e)
+{
+	// NEM-4 service logs report 0001/257E. Extended ID words are unverified.
+	m_device_id2 = 0x2502;
+	m_device_id3 = 0x2500;
+	m_has_reset_pin = true;
+	m_little_endian = true;
+	m_nokia_n643 = true;
+}
+
+samsung_k8s2815eta_device::samsung_k8s2815eta_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock)
+	: intelfsh16_device(mconfig, SAMSUNG_K8S2815ETA, tag, owner, clock, 0x1000000, MFG_SAMSUNG, 0x22f8)
+{
+	m_has_reset_pin = true;
+	m_little_endian = true;
+}
+
+samsung_k8s6415eta_device::samsung_k8s6415eta_device(const machine_config &mconfig, const char *tag, device_t *owner, u32 clock)
+	: intelfsh16_device(mconfig, SAMSUNG_K8S6415ETA, tag, owner, clock, 0x800000, MFG_SAMSUNG, 0x22fa)
+{
+	m_has_reset_pin = true;
+	m_little_endian = true;
+}
+
 sharp_lh28f400_device::sharp_lh28f400_device(const machine_config &mconfig, const char *tag, device_t *owner, uint32_t clock)
 	: intelfsh16_device(mconfig, SHARP_LH28F400, tag, owner, clock, 0x80000, MFG_SHARP, 0xed) { m_has_reset_pin = true; }
 
@@ -434,6 +467,13 @@ void intelfsh_device::device_start()
 	save_item( NAME(m_page_address) );
 	if (m_page_size > 0)
 		save_pointer( NAME(m_page_buffer), page_bytes );
+	if (m_maker_id == MFG_SAMSUNG || m_nokia_n643)
+	{
+		save_item(NAME(m_erase_poll_words));
+		save_item(NAME(m_protection_bank));
+		save_item(NAME(m_erase_poll_seen));
+		save_item(NAME(m_amd_programmed));
+	}
 	save_pointer( &m_data[0], "m_data", m_size);
 }
 
@@ -444,6 +484,7 @@ void intelfsh_device::device_reset()
 	{
 		m_flash_mode = FM_NORMAL;
 		m_status = 0x80;
+		m_amd_programmed = false;
 		m_timer->reset();
 		if (m_sector_erase_selection)
 			std::fill_n(m_erase_selected.get(), m_size / ERASE_BLOCK_SIZE, false);
@@ -516,7 +557,12 @@ void intelfsh_device::nvram_default()
 		if (bytes > m_size)
 			bytes = m_size;
 
-		if (m_bits == 8)
+		if (m_little_endian)
+		{
+			std::copy_n(m_region->base(), bytes, m_data.get());
+			std::fill_n(m_data.get() + bytes, m_size - bytes, 0xff);
+		}
+		else if (m_bits == 8)
 		{
 			for (offs_t offs = 0; offs < bytes; offs++)
 				m_data[offs] = m_region->as_u8(offs);
@@ -566,6 +612,74 @@ bool intelfsh_device::nvram_write(util::write_stream &file)
 //  bit-width-specific readers
 //-------------------------------------------------
 
+bool intelfsh_device::array_read_mode(offs_t offset) const
+{
+	switch (m_flash_mode)
+	{
+	case FM_READID:
+	case FM_READAMDID3:
+	case FM_READCFI:
+	case FM_READSTATUS:
+	case FM_WRITEBUFFER1:
+	case FM_WRITEBUFFER2:
+	case FM_ERASEAMDSELECT:
+	case FM_ERASEAMD4:
+		return false;
+	case FM_READPROTECTION:
+		return (offset >> 20) != m_protection_bank;
+	case FM_ERASEAMDPOLL:
+		return !erase_poll_pending(offset);
+	default:
+		return true;
+	}
+}
+
+bool intelfsh_device::erase_poll_pending(offs_t offset) const
+{
+	return m_flash_mode == FM_ERASEAMDPOLL && offset - u32(m_erase_sector) < m_erase_poll_words;
+}
+
+u32 intelfsh_device::burst_sector_size(u32 byte_address) const
+{
+	if (m_nokia_n643)
+	{
+		// Only banks A and B have 16 KiB boot sectors (AMD 25692A2, table 7).
+		return byte_address >= 0x400000 && (byte_address & 0x1fffff) >= 0x1f0000 ? 0x4000 : 0x10000;
+	}
+
+	return byte_address >= m_size - 0x10000 ? 0x2000 : 0x10000;
+}
+
+u16 intelfsh_device::read_n643_id(u32 address) const
+{
+	// NEM-4 polls mirrored IDs in the CS1 C: window.
+	if (m_read_driven_erase && address * 2 >= m_write_start)
+		address &= 7;
+
+	switch (address)
+	{
+	case 0x00: return m_maker_id;
+	case 0x01: return m_device_id;
+	case 0x03: return 0x0042;
+	case 0x0e: return m_device_id2;
+	case 0x0f: return m_device_id3;
+	default:   return 0;
+	}
+}
+
+u16 intelfsh_device::read_word(u32 address) const
+{
+	u8 const *const bytes = &m_data[address * 2];
+	return m_little_endian ? (bytes[1] << 8) | bytes[0] : (bytes[0] << 8) | bytes[1];
+}
+
+void intelfsh_device::program_word(u32 address, u16 data)
+{
+	u8 *const bytes = &m_data[address * 2];
+	bytes[m_little_endian ? 1 : 0] &= data >> 8;
+	bytes[m_little_endian ? 0 : 1] &= data;
+}
+
 uint32_t intelfsh_device::read_full(uint32_t address)
 {
 	uint32_t data = 0;
@@ -580,8 +694,36 @@ uint32_t intelfsh_device::read_full(uint32_t address)
 			data = m_data[address];
 			break;
 		case 16:
-			data = (m_data[address*2] << 8) | m_data[address*2+1];
+			data = read_word(address);
 			break;
+		}
+		break;
+	case FM_READPROTECTION:
+		data = (address >> 20) == m_protection_bank ? 1 : read_word(address);
+		break;
+	case FM_READCFI:
+	{
+		static constexpr u8 query[] = { 'Q', 'R', 'Y', 2, 0, 0x40 };
+		u32 const word = address & 0xff;
+		if (word >= 0x10 && word < 0x10 + std::size(query))
+			data = query[word - 0x10];
+		else if (word == 0x27)
+			data = std::bit_width(m_size) - 1;
+		break;
+	}
+	case FM_ERASEAMDPOLL:
+		data = read_word(address);
+		if (erase_poll_pending(address))
+		{
+			// NOS waits for DQ3 high and DQ7 low after erase starts.
+			if (!m_erase_poll_seen)
+				data = 0x0008;
+			if (!machine().side_effects_disabled())
+			{
+				if (m_erase_poll_seen)
+					m_flash_mode = FM_NORMAL;
+				m_erase_poll_seen = true;
+			}
 		}
 		break;
 	case FM_READSTATUS:
@@ -592,7 +734,9 @@ uint32_t intelfsh_device::read_full(uint32_t address)
 		data = 0x80; // extended status register for write buffer flag
 		break;
 	case FM_READAMDID3:
-		if ((m_maker_id == MFG_FUJITSU && m_device_id == 0x35) || (m_maker_id == MFG_AMD && m_device_id == 0x3b))
+		if (m_nokia_n643)
+			data = read_n643_id(address);
+		else if ((m_maker_id == MFG_FUJITSU && m_device_id == 0x35) || (m_maker_id == MFG_AMD && m_device_id == 0x3b))
 		{
 			// used in Fujitsu 29DL16X 8bits mode
 			// used in AMD 29LV200 8bits mode
@@ -656,7 +800,9 @@ uint32_t intelfsh_device::read_full(uint32_t address)
 		}
 		break;
 	case FM_READID:
-		if (m_maker_id == MFG_INTEL && m_device_id == 0x16)
+		if (m_nokia_n643)
+			data = read_n643_id(address);
+		else if (m_maker_id == MFG_INTEL && m_device_id == 0x16)
 		{
 			switch (address & 0xff)
 			{
@@ -719,7 +865,7 @@ uint32_t intelfsh_device::read_full(uint32_t address)
 				data = m_data[address];
 				break;
 			case 16:
-				data = (m_data[address*2] << 8) | m_data[address*2+1];
+				data = read_word(address);
 				break;
 			}
 		}
@@ -771,6 +917,18 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 	//logerror( "intelflash_write( %u : %08x, %08x )\n", m_flash_mode, address, data );
 
 	address += m_bank << 16;
+	bool const samsung = m_maker_id == MFG_SAMSUNG;
+	bool const burst = samsung || m_nokia_n643;
+	u32 const unlock_mask = m_nokia_n643 ? 0x3ff : 0x7ff;
+	bool const unlock1 = burst && (address & unlock_mask) == (m_nokia_n643 ? 0x155 : 0x555);
+	bool const unlock2 = burst && (address & unlock_mask) == 0x2aa;
+
+	if (m_flash_mode == FM_ERASEAMDPOLL)
+	{
+		m_flash_mode = FM_NORMAL;
+		if ((data & 0xff) == 0xb0)
+			return;
+	}
 
 	switch( m_flash_mode )
 	{
@@ -778,13 +936,24 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 	case FM_READSTATUS:
 	case FM_READID:
 	case FM_READAMDID3:
+	case FM_READCFI:
+	case FM_READPROTECTION:
 		switch( data & 0xff )
 		{
 		case 0xf0:
 		case 0xff:  // reset chip mode
 			m_flash_mode = FM_NORMAL;
+			m_amd_programmed = false;
+			break;
+		case 0x98:
+			if (samsung && (address & 0x7ff) == 0x55)
+				m_flash_mode = FM_READCFI;
+			else
+				logerror("%s: Unknown flash mode byte %x\n", machine().describe_context(), data & 0xff);
 			break;
 		case 0x90:
+			if (m_nokia_n643 && address != 0 && address != 0x5555)
+				break;
 			// TODO: W640GB also needs this path
 			if ( m_fast_mode && (m_maker_id == MFG_FUJITSU || (m_maker_id == MFG_ST && (m_device_id == 0x22ed || m_device_id == 0x227e))) ) // reset from fast mode (when fast mode is enabled)
 				m_flash_mode = FM_FAST_RESET;
@@ -793,10 +962,13 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 			break;
 		case 0x40:
 		case 0x10:  // program
-			m_flash_mode = FM_WRITEPART1;
+			if (!burst || address * 2 >= m_write_start)
+				m_flash_mode = FM_WRITEPART1;
 			break;
 		case 0x50:  // clear status reg
-			if (((m_maker_id == MFG_SST && m_device_id == 0x61) || (m_maker_id == MFG_AMD && m_device_id == 0x20)) && (m_flash_mode == FM_NORMAL))
+			if (burst)
+				m_flash_mode = FM_NORMAL;
+			else if (((m_maker_id == MFG_SST && m_device_id == 0x61) || (m_maker_id == MFG_AMD && m_device_id == 0x20)) && (m_flash_mode == FM_NORMAL))
 				logerror("Invalid flash mode byte %x\n", data & 0xff);
 			else if (m_maker_id == MFG_ST && (address & 0xfff) == 0xaaa)
 				m_flash_mode = FM_WORDPROGRAM1;
@@ -807,7 +979,19 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 			}
 			break;
 		case 0x20:  // block erase
-			if (m_maker_id == MFG_SST && m_device_id == 0x61)
+			if (burst)
+			{
+				// The native programmer writes 0x20 after AMD programming.
+				if (m_amd_programmed)
+					m_amd_programmed = false;
+				else if (address * 2 >= m_write_start)
+				{
+					u32 const words = burst_sector_size(address * 2) / 2;
+					m_erase_sector = address & ~(words - 1);
+					m_flash_mode = FM_CLEARPART1;
+				}
+			}
+			else if (m_maker_id == MFG_SST && m_device_id == 0x61)
 				logerror("Unknown flash mode byte %x\n", data & 0xff);
 			else if (m_maker_id == MFG_ST && (m_device_id == 0x22ed || m_device_id == 0x227e))
 			{
@@ -821,7 +1005,14 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 			}
 			break;
 		case 0x60:  // set master lock
-			m_flash_mode = FM_SETMASTER;
+			// Samsung sector locking is unimplemented.
+			if (m_nokia_n643)
+			{
+				m_protection_bank = address >> 20;
+				m_flash_mode = FM_READPROTECTION;
+			}
+			else if (!samsung)
+				m_flash_mode = FM_SETMASTER;
 			break;
 		case 0x70:  // read status
 			m_flash_mode = FM_READSTATUS;
@@ -835,7 +1026,7 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 				logerror( "%s: Unknown flash mode byte %x\n", machine().describe_context(), data & 0xff );
 			break;
 		case 0xaa:  // AMD ID select part 1
-			if( ( address & 0xfff ) == 0x555 )
+			if ((address & 0xfff) == 0x555 || unlock1)
 			{
 				m_flash_mode = FM_READAMDID1;
 			}
@@ -851,13 +1042,23 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 			else
 				logerror( "%s: Unknown flash mode byte %x\n", machine().describe_context(), data & 0xff );
 			break;
+		case 0x01:
+		case 0xd0:
+			if (m_flash_mode == FM_READPROTECTION)
+			{
+				m_flash_mode = FM_NORMAL;
+				break;
+			}
+			[[fallthrough]];
 		default:
 			logerror( "%s: Unknown flash mode byte %x\n", machine().describe_context(), data & 0xff );
 			break;
 		}
 		break;
 	case FM_READAMDID1:
-		if( ( address & 0xffff ) == 0x2aa && ( data & 0xff ) == 0x55 )
+		if (unlock2 && (data & 0xff) == 0x55)
+			m_flash_mode = FM_READAMDID2;
+		else if( ( address & 0xffff ) == 0x2aa && ( data & 0xff ) == 0x55 )
 		{
 			m_flash_mode = FM_READAMDID2;
 		}
@@ -881,7 +1082,18 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 		}
 		break;
 	case FM_READAMDID2:
-		if( ( address & 0xffff ) == 0x555 && ( data & 0xff ) == 0x90 )
+		if (unlock1 && (data & 0xff) == 0x90)
+			m_flash_mode = FM_READAMDID3;
+		else if (unlock1 && (data & 0xff) == 0x80)
+			m_flash_mode = FM_ERASEAMD1;
+		else if (unlock1 && (data & 0xff) == 0xa0)
+			m_flash_mode = FM_BYTEPROGRAM;
+		else if (((samsung && unlock1) || (m_nokia_n643 && (address & 0xfff) == 0x555)) && (data & 0xff) == 0xc0)
+		{
+			m_protection_bank = address >> 20;
+			m_flash_mode = FM_READPROTECTION;
+		}
+		else if( ( address & 0xffff ) == 0x555 && ( data & 0xff ) == 0x90 )
 		{
 			m_flash_mode = FM_READAMDID3;
 		}
@@ -983,7 +1195,9 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 		}
 		break;
 	case FM_ERASEAMD1:
-		if( ( address & 0xfff ) == 0x555 && ( data & 0xff ) == 0xaa )
+		if (unlock1 && (data & 0xff) == 0xaa)
+			m_flash_mode = FM_ERASEAMD2;
+		else if( ( address & 0xfff ) == 0x555 && ( data & 0xff ) == 0xaa )
 		{
 			m_flash_mode = FM_ERASEAMD2;
 		}
@@ -997,7 +1211,9 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 		}
 		break;
 	case FM_ERASEAMD2:
-		if( ( address & 0xffff ) == 0x2aa && ( data & 0xff ) == 0x55 )
+		if (unlock2 && (data & 0xff) == 0x55)
+			m_flash_mode = FM_ERASEAMD3;
+		else if( ( address & 0xffff ) == 0x2aa && ( data & 0xff ) == 0x55 )
 		{
 			m_flash_mode = FM_ERASEAMD3;
 		}
@@ -1019,7 +1235,11 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 		}
 		break;
 	case FM_ERASEAMD3:
-		if( (( address & 0xfff ) == 0x555 && ( data & 0xff ) == 0x10 ) ||
+		if (burst && (data & 0xff) == 0x10 && m_write_start)
+		{
+			m_flash_mode = FM_NORMAL;
+		}
+		else if( (( address & 0xfff ) == 0x555 && ( data & 0xff ) == 0x10 ) ||
 			(( address & 0xfff ) == 0xaaa && ( data & 0xff ) == 0x10 ) )
 		{
 			// chip erase
@@ -1052,6 +1272,25 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 		}
 		else if( ( data & 0xff ) == 0x30 )
 		{
+			if (burst)
+			{
+				m_flash_mode = FM_NORMAL;
+				u32 const size = burst_sector_size(address * 2);
+				u32 const base = (address * 2) & ~(size - 1);
+				if (base >= m_write_start)
+				{
+					std::fill_n(m_data.get() + base, size, 0xff);
+					if (m_read_driven_erase)
+					{
+						m_erase_sector = base / 2;
+						m_erase_poll_words = size / 2;
+						m_erase_poll_seen = false;
+						m_flash_mode = FM_ERASEAMDPOLL;
+					}
+				}
+				break;
+			}
+
 			if (m_sector_erase_selection)
 			{
 				std::fill_n(m_erase_selected.get(), m_size / ERASE_BLOCK_SIZE, false);
@@ -1195,8 +1434,9 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 			}
 			break;
 		case 16: // senbbs test mode requires this, note, flash type is guessed there based on manufacturer + device ident as markings were erased
-			m_data[address*2] &= data >> 8;
-			m_data[address*2+1] &= data;
+			if (!burst || address * 2 >= m_write_start)
+				program_word(address, data);
+			m_amd_programmed = burst;
 			break;
 		default:
 			logerror( "FM_BYTEPROGRAM not supported when m_bits == %d (address %08x data %04x)\n", m_bits, address, data );
@@ -1245,8 +1485,8 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 			m_data[address] &= data;
 			break;
 		case 16:
-			m_data[address*2] &= data >> 8;
-			m_data[address*2+1] &= data;
+			if (!burst || address * 2 >= m_write_start)
+				program_word(address, data);
 			break;
 		default:
 			logerror( "FM_WRITEPART1 not supported when m_bits == %d\n", m_bits );
@@ -1326,6 +1566,20 @@ void intelfsh_device::write_full(uint32_t address, uint32_t data)
 		break;
 
 	case FM_CLEARPART1:
+		if (burst)
+		{
+			u32 const size = burst_sector_size(address * 2);
+			u32 const base = (address * 2) & ~(size - 1);
+			if ((data & 0xff) == 0xd0 && (base / 2) == m_erase_sector)
+			{
+				std::fill_n(m_data.get() + base, size, 0xff);
+				m_status = 0x80;
+				m_flash_mode = FM_READSTATUS;
+			}
+			else
+				m_flash_mode = FM_NORMAL;
+			break;
+		}
 		if( ( data & 0xff ) == 0xd0 )
 		{
 			if (m_maker_id == MFG_SST && m_device_id == 0x04)

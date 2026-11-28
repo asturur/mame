@@ -5135,6 +5135,17 @@ end
 
 ---------------------------------------------------
 --
+--@src/devices/machine/mmc_card.h,MACHINES["MMCCARD"] = true
+---------------------------------------------------
+if MACHINES["MMCCARD"] then
+	files {
+		MAME_DIR .. "src/devices/machine/mmc_card.cpp",
+		MAME_DIR .. "src/devices/machine/mmc_card.h",
+	}
+end
+
+---------------------------------------------------
+--
 --@src/devices/machine/smartmed.h,MACHINES["SMARTMEDIA"] = true
 ---------------------------------------------------
 if MACHINES["SMARTMEDIA"] then
