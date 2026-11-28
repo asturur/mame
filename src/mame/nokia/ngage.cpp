@@ -1,6 +1,6 @@
 // license:BSD-3-Clause
 // copyright-holders:Andrea Bogazzi, Jacob Jewell
-// thanks-to: razvang-dev for the help with the firmware decryption
+// thanks-to: razvang-dev (https://github.com/razvang-dev/) for the help with the firmware decryption
 
 #include "emu.h"
 
